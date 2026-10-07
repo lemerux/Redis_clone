@@ -1,0 +1,525 @@
+==============================================================================
+REDIS CLONE IN C++  -  DESIGN DOCUMENT
+Part 1: Features and Project Structure
+==============================================================================
+
+CHANGES IN THIS REVISION (v2)
+-----------------------------
+  - Decision: no WATCH and NO sharing of data between any two clients, not
+    even two clients of the same user. A user has at most ONE live session
+    (one authenticated connection) at a time.
+  - Per-user "max clients" removed (it is always 1). Replaced by session
+    claim/release, idle timeout and TCP keepalive, so a dead peer cannot
+    lock an account forever.
+  - Fixes found in review: sampleable key table (needed by expiry, eviction
+    and SCAN), memory accounting moved earlier, expiry/eviction DELs logged
+    outside the dispatcher, expiry frozen during AOF replay, denyoom flag,
+    fd-reuse race, pre-AUTH input limits, AOF must never log AUTH, kill -9
+    vs fsync test caveat, fork vs threads caveat, benchmark setup for the
+    one-session-per-user rule.
+
+GOAL
+----
+Build a Redis-compatible in-memory server in C++ (C++17 or later) that works
+with the real redis-cli and redis-benchmark. The project is meant to show
+low-latency systems skills to trading and banking employers, so depth,
+correctness and measurement matter more than the number of commands.
+
+SCOPE DECISIONS (updated, v2)
+-----------------------------
+  - Every user has an isolated keyspace. There are NO shared variables and
+    no cross-user visibility of any kind.
+  - No two clients ever share data. A user may have only ONE live session
+    (one authenticated connection) at a time; a second AUTH for a busy user
+    is refused. So there is nothing to WATCH and nothing to race on.
+  - Because of that, these are intentionally NOT implemented: WATCH/UNWATCH,
+    Pub/Sub, and blocking list commands (BLPOP/BRPOP).
+  - Assumption: a "user" is an account selected with AUTH, and the user's data
+    persists across connections and restarts (via AOF/RDB). Data belongs to
+    the account, not to the connection. (If you instead want data to die
+    with the connection, AOF/RDB/AUTH/UserRegistry all lose their purpose and
+    most of Steps 8 and 12 disappear. Not recommended for this project.)
+  - MULTI/EXEC is kept as an optional, simple feature. With no sharing it
+    gives no extra isolation; its value is all-or-nothing queue abort and
+    contiguous AOF logging. Say so honestly in the README.
+
+RULE FOR STRUCT vs CLASS
+------------------------
+  struct = passive data, no invariants, public fields.
+  class  = owns a resource, protects an invariant, or has behavior that must
+           stay consistent (private members, controlled interface).
+
+
+==============================================================================
+SECTION A: PROJECT DIRECTORY LAYOUT
+==============================================================================
+
+redis-clone/
+  CMakeLists.txt
+  README.md                 (design decisions, benchmarks, tradeoffs)
+  src/
+    main.cpp
+    config.h                Config struct
+    net/
+      socket.h/.cpp         Socket (RAII fd wrapper)
+      buffer.h/.cpp         Buffer (input/output byte buffer)
+      connection.h/.cpp     Connection (per-client state)
+      event_loop.h/.cpp     EventLoop (epoll/kqueue, timers)
+    protocol/
+      resp_value.h          RespValue struct
+      resp_parser.h/.cpp    RespParser (incremental)
+      resp_writer.h/.cpp    RespWriter
+    user/
+      user_registry.h/.cpp  User, UserRegistry
+    command/
+      command_table.h/.cpp  CommandSpec, CommandContext, CommandTable
+      cmd_string.cpp        string handlers
+      cmd_hash.cpp          hash handlers
+      cmd_list.cpp          list handlers
+      cmd_set.cpp           set handlers
+      cmd_zset.cpp          sorted set handlers
+      cmd_keys.cpp          DEL, EXISTS, EXPIRE, TTL, KEYS, TYPE ...
+      cmd_server.cpp        PING, ECHO, INFO, CONFIG, FLUSHALL ...
+      cmd_tx.cpp            MULTI, EXEC, DISCARD (optional)
+      cmd_auth.cpp          AUTH, WHOAMI
+    store/
+      object.h              ObjType enum, Object struct
+      database.h/.cpp       Database (one instance per user)
+      key_table.h/.cpp      KeyTable (hash table with O(1) sampling + SCAN)
+      expiry_index.h/.cpp   ExpiryIndex
+    types/
+      hash.h/.cpp           Hash
+      list.h/.cpp           List
+      set.h/.cpp            Set
+      skiplist.h/.cpp       SkipList
+      zset.h/.cpp           ZSet
+    persist/
+      aof_writer.h/.cpp     AofWriter
+      aof_loader.h/.cpp     AofLoader
+      rdb_writer.h/.cpp     RdbWriter
+      rdb_loader.h/.cpp     RdbLoader
+      rdb_format.h          RdbHeader, RdbEntry structs
+    tx/
+      tx_state.h            TxState, QueuedCmd structs
+    evict/
+      eviction_policy.h     EvictionPolicy (abstract)
+      approx_lru.h/.cpp     ApproxLru
+      approx_lfu.h/.cpp     ApproxLfu
+  tests/                    unit tests, fuzz tests, differential tests
+  bench/                    benchmark scripts, results, graphs
+  docs/                     design notes, latency analysis
+
+
+==============================================================================
+SECTION B: CLASSES AND STRUCTS  (what each one is and why)
+==============================================================================
+
+NETWORKING
+----------
+Socket        (class)   RAII wrapper around an int fd. Move-only, closes in
+                        destructor. sizeof == sizeof(int), zero runtime cost.
+Buffer        (class)   Growable byte buffer with read/write cursors. The
+                        cursors must stay consistent, so it is a class.
+Connection    (struct, becomes a class in Step 10)  One per client. Mostly a bag of fields used directly
+                        by the event loop and handlers (like Redis's client
+                        struct). Holds: Socket, input Buffer, output Buffer,
+                        TxState, User* (null until AUTH), and a flag for
+                        "close after reply". Cleanup is automatic because
+                        Socket and Buffer clean up in their destructors.
+                        It gains invariants in Step 10 (the user session must
+                        be released exactly once on close; output-buffer
+                        limit checked in a single queueReply()), so turn it
+                        into a class there.
+EventLoop     (class)   Owns the epoll fd, the connection registry (a vector
+                        indexed by fd is fastest), the listening socket, and
+                        the periodic timer that drives active expiry, AOF
+                        fsync-every-second and eviction checks.
+
+PROTOCOL
+--------
+RespValue     (struct)  Plain data. A std::variant of: simple string, error,
+                        int64, bulk string, array, null.
+RespParser    (class)   Incremental state machine. Must handle partial reads,
+                        pipelined commands in one read, and malformed input
+                        without crashing.
+RespWriter    (class)   Appends encoded replies into a Connection's output
+                        Buffer (OK, error, integer, bulk, array, null).
+
+COMMANDS
+--------
+CommandSpec   (struct)  { name, arity, flags (write, readonly, denyoom,
+                        allowed-before-auth), handler }. denyoom marks
+                        commands that grow memory (SET, LPUSH...). DEL and
+                        other shrinking writes must still work when full.
+CommandContext(struct)  { Database&, Connection&, args, Server state }. Passed
+                        to every handler.
+CommandTable  (class)   Name -> CommandSpec lookup, registration, arity check.
+Handlers      (free functions)  e.g. void cmd_zadd(CommandContext&). No class
+                        per command, no virtual dispatch.
+
+STORAGE CORE
+------------
+ObjType       (enum class)  String, Hash, List, Set, ZSet.
+Object        (struct)  { ObjType type; uint32_t access_meta;
+                        std::variant<std::string, Hash, List, Set, ZSet> data; }
+                        access_meta holds the LRU clock or LFU counter.
+Database      (class)   ONE PER USER. Owns that user's keyspace
+                        (a KeyTable, see below), its ExpiryIndex and
+                        its used-bytes counter. Lazy expiry check happens in
+                        find(). No version counters are needed (no WATCH).
+                        Has a removal sink (callback) fired whenever a key
+                        is removed by lazy expiry, active expiry or eviction,
+                        so the AOF can log a DEL (these happen outside the
+                        command dispatcher).
+ExpiryIndex   (class)   Key -> deadline map plus a structure to sample keys
+                        (vector of keys with expiry plus an index map for O(1)
+                        swap-remove; a min-heap cannot be sampled randomly).
+                        Provides a time-budgeted activeExpireCycle().
+KeyTable      (class)   The keyspace hash table. Must support O(1) random
+                        sampling (expiry and LRU/LFU eviction sample random
+                        keys) and a SCAN cursor that stays valid across
+                        rehashing. std::unordered_map supports neither, so
+                        decide this EARLY (Step 4): either a custom open-
+                        addressing / chained table with reverse-binary cursor
+                        iteration, or unordered_map + a side vector of keys.
+User          (struct)  { id, name, password hash, Database db,
+                        memory quota, session_client_id (0 = nobody logged
+                        in; an id, not a Connection*, so it can never dangle) }.
+UserRegistry  (class)   Owns all User objects (map name -> User). Handles AUTH
+                        lookups, session claim/release (one live session per
+                        user), creation on first use or from a users file,
+                        and round-robins the active expiry cycle across
+                        users within one global time budget.
+
+DATA TYPES  (all classes, because each protects internal invariants)
+--------------------------------------------------------------------
+String        std::string. Optional integer encoding for fast INCR.
+Hash          Wraps unordered_map<string,string>. Later: small-array encoding
+              for tiny hashes (like Redis listpack).
+List          Wraps std::deque<string> first. Later: quicklist (linked list
+              of small arrays) as an optimization.
+Set           Wraps unordered_set<string>. SINTER/SUNION/SDIFF as methods or
+              free functions.
+SkipList      Private struct Node { score, member, forward levels[], span[] }.
+              Exposes insert, erase, rank, range-by-rank, range-by-score.
+              Never exposes nodes.
+ZSet          Owns a SkipList AND an unordered_map<string,double>. Keeps them
+              in sync. This sync is the main invariant of the project.
+
+TRANSACTIONS
+------------
+TxState       (struct)  { bool in_multi; vector<QueuedCmd> queue; bool dirty; }
+QueuedCmd     (struct)  { command name, args }.
+(No WatchedKey and no PubSubHub: not needed with isolated per-user data.)
+
+PERSISTENCE
+-----------
+FsyncPolicy   (enum class)  Always, EverySec, No.
+AofWriter     (class)   Owns the file descriptor, write buffer, fsync timing.
+AofLoader     (class)   Replays the file through the normal parser and
+                        dispatch path. Handles a truncated last command.
+RdbWriter     (class)   Serializes the keyspace to a binary snapshot.
+RdbLoader     (class)   Reads the snapshot back.
+RdbHeader, RdbEntry (structs)  On-disk layout records.
+
+EVICTION
+--------
+EvictionPolicy(abstract class)  onAccess(key, obj), pickVictim(db).
+                        Runtime polymorphism is justified: the policy is a
+                        runtime config choice.
+ApproxLru     (class)   Samples N random keys, evicts the least recently used.
+ApproxLfu     (class)   Samples N keys, uses a logarithmic counter with decay,
+                        evicts the least frequently used.
+
+CONFIG
+------
+Config        (struct)  port, maxmemory (global), per-user quota,
+                        maxmemory_policy, appendonly, appendfsync, rdb save
+                        rules, sample size, users file path, client idle timeout,
+                        TCP keepalive, pre-auth input limit.
+
+
+==============================================================================
+SECTION C: FEATURE DETAILS
+==============================================================================
+
+C1. DATA TYPES AND COMMANDS
+---------------------------
+STRINGS
+  Commands: GET, SET (EX, PX, NX, XX), DEL, EXISTS, INCR, DECR, INCRBY,
+            APPEND, STRLEN, MGET, MSET.
+  Notes: INCR must return an error if the value is not an integer.
+
+HASHES
+  Commands: HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HKEYS, HVALS, HINCRBY.
+  Notes: delete the key when the last field is removed.
+
+LISTS
+  Commands: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET.
+  (BLPOP / BRPOP are skipped: nobody else can push to your list.)
+  Notes: delete the key when the list becomes empty.
+
+SETS
+  Commands: SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SINTER, SUNION, SDIFF,
+            SPOP, SRANDMEMBER.
+
+SORTED SETS
+  Commands: ZADD (NX, XX, GT, LT), ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD,
+            ZRANGE (by rank, WITHSCORES), ZRANGEBYSCORE, ZINCRBY, ZCOUNT.
+  Notes: ties on score are ordered lexicographically by member. Score parsing
+  must handle +inf / -inf.
+
+GENERIC KEY COMMANDS
+  TYPE, KEYS (glob), SCAN, RENAME, DBSIZE, FLUSHALL, EXPIRE, PEXPIRE, TTL,
+  PTTL, PERSIST.
+
+Any command on a key of the wrong type returns:
+  -WRONGTYPE Operation against a key holding the wrong kind of value
+
+
+C2. KEY EXPIRY  (lazy + active)
+-------------------------------
+Lazy expiry:
+  Every Database::find() checks the key's deadline. If expired, delete it and
+  behave as if the key does not exist.
+Active expiry:
+  A periodic cycle (for example 10 times per second) samples keys that have an
+  expiry (20 at a time). Delete the expired ones. If more than 25 percent of
+  the sample was expired, repeat. STOP when a time budget (for example 1 ms)
+  is used, so the cycle can never cause a latency spike.
+Details:
+  - Store deadlines as absolute milliseconds from a monotonic or wall clock
+    (decide and document which; AOF replay needs absolute wall-clock times).
+  - Expired keys must be logged to the AOF as DEL. This includes lazy expiry
+    triggered inside a READ command (GET deletes the key) and active expiry
+    from the timer. Neither goes through the "after a successful write"
+    dispatcher hook, so use the Database removal sink for them.
+  - While an AOF/RDB is being loaded, expiry is FROZEN (lazy and active).
+    Otherwise a key that "expired during downtime" vanishes mid-replay and a
+    later INCR/APPEND in the log produces a different result than the
+    original run. After load finishes, run a full expiry pass.
+  - Overwriting a key with SET clears its TTL unless KEEPTTL is given.
+
+
+C3. USERS, AUTH AND ISOLATION  (replaces Pub/Sub)
+--------------------------------------------------
+Commands: AUTH <user> <password>, WHOAMI.
+  - A new connection has no user. Until AUTH succeeds, only AUTH, PING and
+    QUIT are allowed; anything else returns -NOAUTH.
+  - After AUTH, Connection::user points at that User, and every command is
+    executed against user->db. Handlers receive the Database through
+    CommandContext, so they never know about other users.
+  - Isolation rule: no code path may read or write another user's Database.
+    Enforce this by structure: handlers only ever get ctx.db.
+  - The same key name (for example "balance") can exist in many users with
+    different values. KEYS, SCAN, DBSIZE, FLUSHALL only touch the caller's db.
+  - One live session per user: AUTH claims the user's session. If another
+    connection already holds it, AUTH returns an error and the connection
+    stays unauthenticated (rejecting the newcomer is recommended over kicking
+    the owner). The session is released exactly once, in the single
+    Connection close path.
+  - A second AUTH on an already authenticated connection is an error (no
+    switching users mid-connection). AUTH is never queued inside MULTI.
+  - A dead peer (no FIN) must not lock the account: enable SO_KEEPALIVE and
+    a client idle timeout so the session is eventually released.
+  - The account's data stays in memory after its owner disconnects, and
+    expiry, eviction and AOF keep working for it (timers need no connection).
+  - Before AUTH the user and quota are unknown, so unauthenticated
+    connections get a small input limit (for example 64 KB per command). The
+    large limits (512 MB bulk) apply only after AUTH.
+  - Failed AUTH attempts: count per connection and disconnect after N. The
+    check runs on the shared event loop, so a slow password KDF would stall
+    every user: keep the hash cheap (documented non-production) or run it
+    off-thread. Compare hashes in constant time.
+  - Passwords: store a salted hash, never plaintext. Keep it simple (for
+    example SHA-256 + salt) and document that this is not production-grade.
+  - Optional: per-user limits (memory quota, output-buffer size); see C6 and
+    Step 10.
+
+
+C4. TRANSACTIONS
+----------------
+Commands: MULTI, EXEC, DISCARD.   (Optional feature; WATCH is not implemented.)
+  - Since no other client can touch your keys, EXEC adds no isolation. Its
+    value here is: abort on queueing errors and contiguous AOF logging.
+  - Cap the queue length/size (queued commands are memory outside the
+    normal accounting).
+  - After MULTI, commands reply +QUEUED and are stored in TxState::queue.
+  - EXEC runs the queue back to back (no other client can interleave because
+    the server is single-threaded) and returns an array of replies.
+  - A syntax error or unknown command while queueing sets "dirty" and EXEC
+    returns EXECABORT.
+  - Runtime errors inside EXEC do NOT roll back (same as Redis). Document this.
+  - The AOF should log the whole transaction contiguously (wrap in
+    MULTI/EXEC, or write the commands together).
+
+
+C5. PERSISTENCE
+---------------
+AOF (append-only file):
+  - After each successful WRITE command, append it in RESP format to a
+    buffer. Hook this in the dispatcher, not inside each handler.
+  - Per-user data: either one AOF file per user (simplest, easy to replay in
+    isolation), or one shared file where the writer emits an internal
+    user-switch record (user NAME only) whenever the user changes (like
+    Redis's SELECT records). NEVER write the AUTH command itself to the AOF:
+    it carries the password. Pick one and document it. One file per user also makes
+    per-user fsync policies and per-user rewrites possible.
+  - Fsync policies:
+      always    fsync before replying, once per event-loop batch before that
+              batch's replies are flushed (safest, slowest)
+      everysec  fsync once per second from the event loop timer
+      no        leave it to the OS
+  - Relative expiry commands (EXPIRE 10) must be rewritten as absolute
+    (PEXPIREAT <timestamp>) before logging, or replay will extend TTLs.
+  - Startup: if the AOF exists, replay it through the normal dispatch path
+    with replies discarded and AOF writing disabled during the load.
+  - A truncated final command (crash mid-write) must be detected and ignored
+    (or truncated), not crash the loader.
+  - AOF rewrite (compaction): fork, write the current dataset as the minimal
+    command set into a new file, then swap. Commands received meanwhile go to
+    a rewrite buffer and are appended before the swap.
+  - Only ONE fork child at a time (BGSAVE and AOF rewrite exclude each
+    other), otherwise copy-on-write memory can triple. One fork covers all
+    users' files.
+
+RDB-style snapshots:
+  - Binary file: magic header + version, then one section per user (user
+    name, key count), and inside each section per key: type byte, optional
+    expiry, key, value (length-prefixed), then a checksum (CRC64 or CRC32).
+    Alternatively write one snapshot file per user.
+  - SAVE (blocking) and BGSAVE (fork(), child writes the file, parent keeps
+    serving thanks to copy-on-write).
+  - Write to a temp file, fsync, then rename() over the old file so a crash
+    never leaves a half-written snapshot.
+  - Startup: if both exist, prefer the AOF (more complete).
+  - Skip keys already expired when loading.
+
+
+C6. EVICTION  (maxmemory)
+-------------------------
+Config: maxmemory <bytes>, maxmemory-policy <policy>, and optionally a
+per-user quota (user-maxmemory <bytes>).
+Scope of eviction (choose and document):
+  - Per-user quota (recommended): a user at its quota only evicts its own
+    keys, so one user can never push out another user's data. Sampling is
+    done inside that user's Database.
+  - Global limit: do NOT evict another user's keys to make room for a writer
+    (that breaks isolation). Instead treat maxmemory as an admission cap:
+    require sum(user quotas) <= maxmemory when users are created/loaded, so
+    the global limit can never be hit before a user's own quota.
+Policies to support:
+  noeviction        return -OOM on writes when full
+  allkeys-lru       approximate LRU across all keys
+  volatile-lru      only keys that have a TTL
+  allkeys-lfu       approximate LFU across all keys
+  volatile-lfu      only keys with TTL
+  (optional) allkeys-random, volatile-ttl
+Approximate LRU:
+  - Each Object stores a coarse 24-bit clock (seconds) of last access.
+  - To evict: sample N keys (default 5), evict the one with the oldest clock.
+    Optionally keep a small "eviction pool" of good candidates across samples.
+Approximate LFU:
+  - 8-bit logarithmic counter: increment with probability 1/(counter * factor
+    + 1). Decay the counter over time (for example once per minute without
+    access). New keys start at a small initial value so they are not evicted
+    instantly.
+  - Evict the sampled key with the lowest counter.
+Memory accounting:
+  - Track approximate used bytes: key size + value size + per-object
+    overhead. Update on every insert, delete and resize. Exact accounting is
+    not required but must be consistent and documented.
+  - Run the eviction check before executing each command flagged denyoom;
+    evict in a loop until under the limit (or no victim is available, then
+    return -OOM). Shrinking commands (DEL, UNLINK, EXPIRE...) must never be
+    refused, or a full user can never free space.
+  - Evicted keys must be logged to the AOF as DEL.
+
+
+C7. NETWORKING / EVENT LOOP
+---------------------------
+  - Non-blocking sockets, epoll (Linux) with level-triggered or edge-triggered
+    mode (document your choice).
+  - Accept loop, read into Connection::in_buf, parse all complete commands,
+    execute, append replies to Connection::out_buf, write when the socket is
+    writable (register EPOLLOUT only when there is pending output).
+  - Pipelining: one read may contain many commands. Batch the replies and
+    flush once.
+  - Close connections cleanly on EOF, errors and output-buffer limit breaches.
+  - fd-reuse race: if you close fd 7 and accept a new client that gets fd 7
+    within the same epoll_wait batch, a stale event for the old fd lands on
+    the new connection. Defer closes to the end of the loop iteration (or
+    tag each connection with a generation id and compare it).
+  - Every close goes through ONE function that releases the user session,
+    drops the TxState and unregisters the fd.
+  - Set TCP_NODELAY on client sockets.
+  - A periodic timer (serverCron, for example every 100 ms) drives active
+    expiry, AOF everysec fsync, BGSAVE child reaping and stats.
+
+
+==============================================================================
+SECTION D: KEY DESIGN DECISIONS (be ready to defend these in interviews)
+==============================================================================
+  1. std::variant vs virtual base class for value types.
+  2. Skip list vs balanced tree for sorted sets (simpler, range queries,
+     rank via span counts).
+  3. Single-threaded event loop: no locks, atomic commands, predictable
+     latency; cost is one core of throughput.
+  4. unordered_map vs custom open-addressing table (benchmark both).
+  5. Free-function handlers vs functors.
+  6. Where AOF logging hooks in (dispatcher, after success).
+  7. Time-budgeted active expiry.
+  8. fork() snapshots: copy-on-write benefits, memory doubling risk, fork
+     latency on large heaps.
+  9. fsync policy tradeoffs (durability vs latency).
+  10. Approximate LRU/LFU vs exact: memory overhead vs accuracy.
+  11. One Database per user (isolation by construction) vs a single keyspace
+      with "user:key" prefixes (cheaper, but weaker isolation and harder
+      per-user quotas, flush and persistence).
+  12. Because users share nothing, a sharded multi-threaded design needs no
+      locks: pin each user to one thread. Discuss the tradeoff (a single hot
+      user cannot use more than one core). Caveat: fork()-based BGSAVE/AOF
+      rewrite is unsafe once several threads mutate data (the child can
+      capture another thread's half-finished update), so a threaded design
+      needs per-shard, non-fork snapshotting. Session claim also becomes a
+      cross-thread operation.
+  13. One live session per user vs many sessions per user: simpler (no data
+      races between clients, no WATCH), at the cost that a client cannot
+      open a connection pool for one account.
+
+
+==============================================================================
+SECTION E: TESTING AND MEASUREMENT PLAN
+==============================================================================
+  - Unit tests per type (SkipList, ZSet sync, Hash, List, Set, ExpiryIndex).
+  - Isolation tests: two users write the same key names with different
+    values, interleaved, and each must only ever read its own. FLUSHALL,
+    KEYS and eviction by one user must not affect the other.
+  - Session tests: second AUTH for a busy user is refused and the owner is
+    undisturbed; session is released on clean close, kill -9 of the client,
+    idle timeout; re-AUTH on an authenticated connection is an error.
+  - Parser fuzzing (random and malformed bytes, split at every offset).
+  - Differential testing: generate random command sequences, run against real
+    Redis and your server, compare replies. Normalize nondeterminism: do not
+    compare SPOP/SRANDMEMBER results directly, compare KEYS/SMEMBERS/HGETALL
+    as sets, avoid TTL-sensitive commands except with generous margins, and
+    remember DBSIZE/KEYS may still count not-yet-reaped expired keys.
+  - Crash tests: kill -9 during writes, restart, verify the AOF replay is
+    consistent for each fsync policy. NOTE: kill -9 only loses data still in
+    your process's user-space buffer; bytes already passed to write() survive
+    even with fsync off. To really test fsync policies you need power-loss
+    simulation (VM hard reset, dm-flakey, or an LD_PRELOAD shim that drops
+    unsynced writes).
+  - Sanitizers: build and test with ASan, UBSan and TSan (if threaded).
+  - Benchmarks: redis-benchmark against both servers, with and without
+    pipelining. Report throughput and p50 / p99 / p99.9 latency. With one
+    session per user, a single "redis-benchmark --user X -c 50" is refused:
+    run N benchmark processes with -c 1, one user each (and the same N
+    processes against real Redis for fairness). PING needs no AUTH.
+  - Profiling: perf and flamegraphs, with a before/after table for each
+    optimization.
+  - Valgrind or heaptrack for memory leaks and allocation counts.
+
+==============================================================================
+END OF PART 1
+==============================================================================

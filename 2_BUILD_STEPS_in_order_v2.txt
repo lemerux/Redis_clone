@@ -1,0 +1,525 @@
+==============================================================================
+REDIS CLONE IN C++  -  BUILD STEPS IN ORDER
+Part 2: What to build, which classes/structs, which features, how to verify
+==============================================================================
+
+CHANGES IN THIS REVISION (v2)
+-----------------------------
+  - No WATCH, and no sharing between any two clients: one live session per
+    user. Max-clients limit removed; session claim/release, idle timeout and
+    keepalive added.
+  - Memory accounting moved from Step 11 to Step 4 (Step 10 quotas needed it).
+  - KeyTable (sampleable, SCAN-safe) added in Step 4 instead of discovering
+    the need in Steps 5 and 11.
+  - SCAN, RENAME, SRANDMEMBER, INFO, CONFIG now assigned to a step.
+  - Expiry/eviction DEL logging, frozen expiry during replay, denyoom,
+    fd-reuse race, pre-AUTH limits, test caveats (kill -9, DUMP, differential
+    nondeterminism), fork rules, benchmark setup, honest time estimate.
+
+HOW TO USE THIS DOCUMENT
+------------------------
+Do the steps in order. Each step lists:
+  BUILD    - the classes / structs / functions to create
+  FEATURES - the commands or behaviors to implement
+  TEST     - how to check it works before moving on
+  DONE WHEN- the exit criterion
+
+Do not start a step until the previous one's "DONE WHEN" is true. Commit to git
+at the end of every step. Keep a running notes file for the README.
+
+Time: the step estimates below add up to roughly 12 to 18 weeks of focused
+full-time work. Part-time will be longer; 2 to 4 months was optimistic.
+
+SCOPE (updated, v2)
+-------------------
+  - Each user has an isolated keyspace (one Database per user). Nothing is
+    shared between users.
+  - No two clients ever share data: a user has at most ONE live session
+    (authenticated connection) at a time; a second AUTH for a busy user is
+    refused.
+  - Not implemented: WATCH/UNWATCH, Pub/Sub, BLPOP/BRPOP.
+  - MULTI/EXEC is optional and simple (it adds no isolation here).
+  - Assumption: a user is an account selected by AUTH, with data that
+    persists across connections and restarts.
+
+
+==============================================================================
+STEP 0: PROJECT SETUP                                         (0.5 day)
+==============================================================================
+BUILD
+  - CMake project, C++17 or C++20, warnings on (-Wall -Wextra -Wpedantic).
+  - Directory layout from Part 1.
+  - Test framework (GoogleTest or Catch2).
+  - Build presets: Debug+ASan/UBSan, Release (-O2 -march=native), Profile.
+  - Config struct (port 6379 default).
+  - Install redis-server, redis-cli, redis-benchmark for comparison.
+DONE WHEN
+  - An empty main builds in all presets and one dummy test runs.
+
+
+==============================================================================
+STEP 1: BLOCKING TCP SERVER + PING                             (1-2 days)
+==============================================================================
+BUILD
+  - Socket (class): RAII fd wrapper, move-only.
+  - Simple listen/accept/read/write using blocking calls, one client at a time.
+FEATURES
+  - Accept a connection, read bytes, reply "+PONG\r\n" to anything.
+TEST
+  - redis-cli -p 6379 ping   -> PONG
+DONE WHEN
+  - Server starts, serves redis-cli, and closes cleanly with no fd leaks
+    (check with ls /proc/<pid>/fd).
+
+
+==============================================================================
+STEP 2: RESP PARSER AND WRITER                                 (3-5 days)
+==============================================================================
+BUILD
+  - Buffer (class): growable byte buffer with read/write positions.
+  - RespValue (struct): variant of simple string, error, int, bulk, array, null.
+  - RespParser (class): incremental. Returns "need more data", "got a command",
+    or "protocol error".
+  - RespWriter (class): writeOk, writeError, writeInt, writeBulk, writeNull,
+    writeArray header.
+FEATURES
+  - Parse arrays of bulk strings (what clients send).
+  - Parse inline commands (optional, for telnet testing).
+  - Handle pipelined commands in one buffer and commands split across reads.
+TEST
+  - Unit tests: feed the parser one byte at a time, then in random chunks,
+    then many commands at once. All must give identical results.
+  - Fuzz: random bytes must never crash or hang.
+  - Reject oversized lengths (for example bulk > 512 MB, array > 1M), and use
+    a much smaller limit (for example 64 KB per command) for connections
+    that have not authenticated yet; the user and quota are unknown then.
+DONE WHEN
+  - Parser passes split-at-every-offset tests and fuzzing under ASan.
+
+
+==============================================================================
+STEP 3: EVENT LOOP + MANY CLIENTS                              (4-6 days)
+==============================================================================
+BUILD
+  - EventLoop (class): epoll_create, epoll_ctl add/mod/del, epoll_wait,
+    non-blocking listening socket, timer tick (for example every 100 ms).
+  - Connection (struct): Socket, in Buffer, out Buffer, client id,
+    flags (close_after_reply), User* user (null until AUTH, see Step 4).
+    A struct is enough; add a class only if you need to enforce an invariant
+    such as an output-buffer limit.
+  - Connection registry: vector<unique_ptr<Connection>> indexed by fd.
+  - CommandSpec / CommandContext (structs), CommandTable (class).
+  - First handlers as free functions: cmd_ping, cmd_echo, cmd_quit.
+FEATURES
+  - Accept many clients. Read, parse, dispatch, buffer replies, flush.
+  - Register EPOLLOUT only when there is unsent output.
+  - TCP_NODELAY, SO_REUSEADDR, handle EAGAIN, EINTR, partial writes, EOF.
+  - Unknown command -> -ERR unknown command; wrong arity -> -ERR wrong number
+    of arguments.
+  - Close connections through ONE function, deferred to the end of the loop
+    iteration (or tag connections with a generation id), so a reused fd
+    cannot receive a stale event from the previous owner.
+TEST
+  - 1000 concurrent clients doing PING.
+  - redis-benchmark -t ping -c 50 -n 100000, with and without -P 16 pipeline.
+  - A client disconnecting mid-command must not leak or crash.
+  - Close a client and accept a new one (same fd) inside one epoll_wait
+    batch: the new client must not see the old client's event.
+  - Log every command redis-cli (interactive) and redis-benchmark send at
+    startup (for example COMMAND DOCS, CONFIG GET) and answer them minimally
+    so they do not break; this list feeds the pre-AUTH allow-list in Step 4.
+DONE WHEN
+  - redis-benchmark runs to completion, no leaks (ASan), fd count returns to
+    baseline after clients disconnect.
+
+
+==============================================================================
+STEP 4: USERS, DATABASE + STRINGS                              (4-6 days)
+==============================================================================
+BUILD
+  - ObjType (enum class), Object (struct with std::variant data + access_meta).
+  - KeyTable (class): the keyspace hash table. Needs O(1) random sampling
+    (Steps 5 and 11) and a rehash-safe SCAN cursor. Decide now: custom table,
+    or unordered_map + side vector of keys. Switching later is painful.
+  - Database (class): find(), findOrCreate(), erase(), size(), flush().
+    ONE INSTANCE PER USER. Tracks used_bytes on every insert/erase/resize
+    (moved here from Step 11: quotas in Step 10 need it). Has a removal sink
+    (callback) fired when a key is removed by lazy expiry, active expiry or
+    eviction, so Step 8 can log DELs.
+  - User (struct): { id, name, password hash, Database db, quota,
+    session_client_id }. Store an id, not a Connection*, so it cannot dangle.
+  - UserRegistry (class): map name -> User, lookup, create (from a users file
+    or a config), password verification, claimSession()/releaseSession().
+  - CommandContext now carries Database& for the authenticated user. Handlers
+    never see other users' data.
+  - cmd_auth.cpp: AUTH, WHOAMI.
+  - cmd_string.cpp handlers.
+  - cmd_keys.cpp: DEL, EXISTS, TYPE, DBSIZE, FLUSHALL, KEYS, SCAN, RENAME.
+  - cmd_server.cpp: ECHO, INFO (minimal for now), CONFIG GET (minimal).
+FEATURES
+  - AUTH <user> <password>: binds the connection to that user's Database and
+    claims the user's single session. If the user already has a live session
+    -> error, connection stays unauthenticated. Second AUTH on an
+    authenticated connection -> error.
+  - Before AUTH only AUTH, PING, QUIT (plus whatever redis-cli/redis-benchmark
+    need at startup, found in Step 3) are allowed, else -NOAUTH.
+  - SET (with EX, PX, NX, XX, KEEPTTL parsing can wait until Step 5),
+    GET, INCR, DECR, INCRBY, APPEND, STRLEN, MGET, MSET.
+  - WRONGTYPE error helper used by every later type.
+  - Integer parsing with overflow detection (INCR on 2^63-1 must error).
+TEST
+  - Unit tests for each command.
+  - Isolation test: users A and B both SET "balance" to different values,
+    interleaved from separate connections; each only ever reads its own.
+    DEL, KEYS, DBSIZE and FLUSHALL by A leave B untouched.
+  - Session test: while A is connected, a second connection doing AUTH A is
+    refused and A is undisturbed; after A disconnects, AUTH A succeeds and
+    A's data is still there.
+  - Differential test script: random SET/GET/INCR/APPEND/DEL sequences against
+    real Redis; compare all replies. (Your server needs AUTH, real Redis does
+    not: handle that in the harness.) Normalize nondeterminism later when
+    sets/hashes/expiry appear: compare unordered replies as sets.
+DONE WHEN
+  - Differential test of 100k random string operations shows zero differences.
+
+
+==============================================================================
+STEP 5: KEY EXPIRY                                             (3-4 days)
+==============================================================================
+BUILD
+  - ExpiryIndex (class): key -> deadline map, sampling container.
+  - Database::find() does the lazy check.
+  - Database::activeExpireCycle(time_budget) per user, called from the timer
+    tick through UserRegistry::activeExpireCycle(total_budget), which
+    round-robins across users (remember where it stopped) so the total stall
+    stays within one budget no matter how many users exist.
+  - Clock helper: nowMs() (wall-clock ms, so AOF/RDB deadlines stay valid).
+    Use std::chrono::steady_clock for ALL latency/stall measurement; wall
+    clock can jump.
+  - ExpiryIndex needs O(1) random sample and O(1) removal (vector of keys +
+    index map, swap-remove).
+FEATURES
+  - SET ... EX/PX, EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST.
+  - TTL return codes: -2 missing key, -1 no expiry.
+  - SET clears TTL unless KEEPTTL.
+  - Loading mode: while AOF/RDB is loading, lazy and active expiry are
+    disabled (see Step 8), then one full expiry pass runs after load.
+  - Active cycle: sample 20 keys, delete expired, repeat while >25 percent
+    expired, hard stop at the time budget.
+TEST
+  - Key with PX 100 is gone after 150 ms, even if never accessed again
+    (verifies the active cycle).
+  - Insert 1M keys with short TTL, measure the longest event-loop stall while
+    they expire. It must stay under your budget.
+  - Also measure the stall of DEL on one huge container (for example a set of
+    1M members). The active-expiry budget does not cover freeing big values;
+    note the result and consider incremental/lazy freeing.
+DONE WHEN
+  - Expiry is correct (lazy and active) and the max stall is measured and
+    recorded for the README.
+
+
+==============================================================================
+STEP 6: HASHES, LISTS, SETS                                    (1-2 weeks)
+==============================================================================
+BUILD
+  - Hash (class)  wrapping unordered_map<string,string>.
+  - List (class)  wrapping std::deque<string>.
+  - Set  (class)  wrapping unordered_set<string>.
+  - cmd_hash.cpp, cmd_list.cpp, cmd_set.cpp.
+  - Add each type as a variant alternative in Object.
+FEATURES
+  Hash: HSET, HGET, HDEL, HEXISTS, HLEN, HGETALL, HKEYS, HVALS, HINCRBY.
+  List: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET.
+  Set : SADD, SREM, SISMEMBER, SMEMBERS, SCARD, SINTER, SUNION, SDIFF, SPOP,
+        SRANDMEMBER.
+  - Auto-delete the key when a container becomes empty.
+  - Negative indexes for LRANGE/LINDEX.
+TEST
+  - Unit tests plus differential tests for each type.
+  - WRONGTYPE checks (for example LPUSH on a string key).
+DONE WHEN
+  - All three types pass differential tests; empty containers never remain
+    in the keyspace.
+
+
+==============================================================================
+STEP 7: SKIP LIST + SORTED SETS                                (1-2 weeks)
+==============================================================================
+BUILD
+  - SkipList (class): private Node { double score; string member;
+    levels[] of { forward*, span } }, backward pointer, max level 32,
+    promotion probability 0.25.
+      insert(score, member), erase(score, member), rank(score, member),
+      getByRank(r), rangeByRank(a, b), rangeByScore(min, max), size().
+  - ZSet (class): SkipList + unordered_map<string,double>, one add/remove/
+    updateScore API that updates both so they cannot diverge.
+  - cmd_zset.cpp.
+FEATURES
+  - ZADD (NX, XX, GT, LT, CH), ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD,
+    ZRANGE (WITHSCORES, REV), ZRANGEBYSCORE, ZINCRBY, ZCOUNT, ZREMRANGEBYRANK.
+  - Order: by score, ties by member (lexicographic).
+  - Parse +inf, -inf, and exclusive ranges like "(5".
+TEST
+  - Property test: after random operations, compare SkipList contents with a
+    std::set<pair<double,string>> reference.
+  - Invariant test: ZSet map size == SkipList size after every operation.
+  - Differential test against real Redis.
+  - Micro-benchmark: insert 1M members, measure ZADD and ZRANK latency.
+DONE WHEN
+  - Property and differential tests pass; you can explain span-based rank.
+
+
+==============================================================================
+STEP 8: AOF PERSISTENCE                                        (1-2 weeks)
+==============================================================================
+BUILD
+  - FsyncPolicy (enum class): Always, EverySec, No.
+  - AofWriter (class): open in append mode, buffer, flush, fsync by policy.
+  - AofLoader (class): read file with RespParser, execute each command via
+    the normal dispatcher with replies discarded.
+  - Dispatcher hook: after a successful write command, call
+    aof.append(user, command). Use CommandSpec flags to know which are writes.
+    Never log AUTH (it contains the password).
+  - Removal sink: lazy expiry inside a read command (GET), active expiry and
+    eviction all delete keys OUTSIDE the write-command hook. Connect the
+    Database removal sink to aof.append(user, DEL key) so replay matches.
+  - Decide and document the per-user layout: one AOF file per user (simplest)
+    or one shared file with "user switch" records. On load, replay each
+    record into the correct user's Database.
+  - Rewrite relative expiry to absolute before logging.
+FEATURES
+  - appendonly yes/no, appendfsync always/everysec/no (via Config).
+  - Replay on startup, with AOF writing disabled AND expiry frozen during the
+    load, then a full expiry pass after it (otherwise a key that expired
+    during downtime disappears mid-replay and later INCR/APPEND diverge).
+  - Ignore (and truncate) a partial command at the end of the file.
+  - Expired and evicted keys log a DEL.
+  - BGREWRITEAOF (later in this step or Step 12): fork, dump the dataset as
+    commands to a temp file, buffer new writes, append them, rename(). One
+    fork covers all users' files; never run it together with BGSAVE.
+TEST
+  - Write data, restart, verify identical dataset. DUMP is not implemented,
+    so compare with a type-aware scan: KEYS + TYPE, then GET / HGETALL /
+    LRANGE / SMEMBERS / ZRANGE WITHSCORES for each key, plus PTTL.
+  - Crash test: run a client writing continuously, kill -9 the server at a
+    random time, restart, verify the dataset is a valid prefix of the writes
+    (for "always": nothing acknowledged is lost).
+    CAVEAT: kill -9 does not discard bytes already passed to write(), so it
+    cannot tell the fsync policies apart; it only loses your user-space
+    buffer. To test fsync semantics simulate power loss (VM hard reset,
+    dm-flakey, or an LD_PRELOAD shim that drops unsynced writes).
+  - Corrupt/truncate the file by hand and check the loader's behavior.
+  - Measure throughput for each fsync policy and record it.
+DONE WHEN
+  - 100 random kill -9 runs recover cleanly, at least one power-loss
+    simulation per fsync policy passes, fsync policy numbers recorded.
+
+
+==============================================================================
+STEP 9: TRANSACTIONS (OPTIONAL, NO WATCH)                      (2-3 days)
+==============================================================================
+BUILD
+  - TxState, QueuedCmd (structs), stored inside Connection.
+  - cmd_tx.cpp: MULTI, EXEC, DISCARD.
+  - Dispatcher change: if in_multi and the command is not
+    EXEC/DISCARD/MULTI, queue it and reply +QUEUED.
+  - No per-key versions, no WATCH, no Database::touch().
+FEATURES
+  - EXEC runs the queue back to back and returns an array of replies.
+  - EXECABORT if a queueing error occurred.
+  - Nested MULTI -> error. EXEC or DISCARD without MULTI -> error.
+  - Queue is discarded if the client disconnects.
+  - AUTH is never queued; cap queue length/size.
+  - Remember in the README: with no WATCH and no sharing, EXEC gives no extra
+    isolation; it gives queue-abort semantics and contiguous AOF logging.
+  - AOF: log the transaction contiguously.
+TEST
+  - Syntax error while queueing -> EXECABORT.
+  - Runtime error in the middle of EXEC does not stop later commands.
+  - A user's transaction only affects that user's Database.
+DONE WHEN
+  - Behaviors above match real Redis in a side-by-side script.
+
+
+==============================================================================
+STEP 10: PER-USER LIMITS AND ISOLATION HARDENING               (3-5 days)
+==============================================================================
+BUILD
+  - Per-user limits stored in User: memory quota, max output-buffer size per
+    connection (check in one queueReply() function; make Connection a class
+    now so this and session release are enforced invariants). Quota
+    accounting already exists from Step 4; with noeviction a user over quota
+    gets -OOM on denyoom commands here, eviction policies arrive in Step 11.
+  - Client idle timeout and SO_KEEPALIVE so a dead peer releases its session.
+  - Per-user stats: used bytes, key count, commands processed (INFO section).
+  - Safe disconnect handling: every close calls releaseSession() exactly once;
+    no dangling User* or Database* anywhere.
+FEATURES
+  - Refuse AUTH for a user that already has a live session (already built in
+    Step 4; here harden it: idle timeout, keepalive, release on every close
+    path including errors and output-buffer breaches).
+  - Disconnect clients that exceed the output-buffer limit.
+  - Rate or size limits on a single command (for example max bulk length)
+    so one user cannot stall the shared event loop.
+  - Optional: password hashing with salt, and a users file loaded at startup.
+    Limit failed AUTH attempts per connection. A slow KDF would stall the
+    shared loop, so keep it cheap or run it off-thread.
+TEST
+  - Concurrency/isolation stress test: 20 clients, one user each, run random
+    commands for minutes. Each client checks its own expected state
+    (a model kept in the test). No cross-user contamination ever. Add extra
+    connections that try to AUTH as busy users: all refused, owners
+    undisturbed.
+  - Kill clients mid-command: no leaks or use-after-free (ASan).
+  - One user filling its quota does not affect another user's writes.
+DONE WHEN
+  - Stress test passes under ASan/UBSan and limits behave as documented.
+
+
+==============================================================================
+STEP 11: EVICTION (LRU / LFU)                                  (1 week)
+==============================================================================
+BUILD
+  - Memory accounting already exists (Step 4); here add the global total and
+    enforcement. Eviction samples keys through KeyTable::sample().
+  - EvictionPolicy (abstract class): onAccess(obj), pickVictim(db).
+  - ApproxLru (class): 24-bit second-resolution clock stored in
+    Object::access_meta; samples N keys.
+  - ApproxLfu (class): 8-bit log counter + decay timestamp.
+  - Config: maxmemory (global), user-maxmemory (per-user quota),
+    maxmemory_policy, maxmemory_samples.
+  - Hook: before executing a command flagged denyoom, if the user's
+    used_bytes exceeds the user's quota, evict from that user's Database
+    until under the limit, or return -OOM (noeviction or no victim). DEL and
+    other shrinking commands are never refused. A user at quota never evicts
+    another user's keys.
+  - At startup/user creation require sum(user quotas) <= maxmemory, so the
+    global limit never triggers before a user's own quota (otherwise a tiny
+    user gets -OOM because of other users).
+FEATURES
+  - Policies: noeviction, allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu.
+  - Update access_meta on every key read/write (cheap).
+  - Evictions logged to AOF as DEL, through the Database removal sink.
+TEST
+  - Fill to maxmemory with a skewed access pattern (hot 20 percent of keys);
+    check the hot keys survive more often under LRU/LFU than random eviction.
+  - Experiment: vary sample size (3, 5, 10) and plot hit rate vs sample size.
+    This graph is great README material.
+DONE WHEN
+  - Memory stays near the limit under load; hit-rate experiment recorded.
+
+
+==============================================================================
+STEP 12: RDB SNAPSHOTS                                         (1 week)
+==============================================================================
+BUILD
+  - RdbHeader, RdbEntry (structs).
+  - RdbWriter (class): header, then a section per user (user name, key
+    count) with per-key records for all five types, expiry, checksum. Or one
+    snapshot file per user (simpler, and allows per-user restore).
+  - RdbLoader (class): validate magic/version/checksum, load, skip expired.
+  - Commands: SAVE, BGSAVE (fork), LASTSAVE.
+  - Periodic "save <seconds> <changes>" rules checked in the timer tick.
+  - Child-process reaping with waitpid(WNOHANG) in the timer tick.
+FEATURES
+  - Write to temp file, fsync, rename().
+  - Only one fork child at a time: BGSAVE and BGREWRITEAOF exclude each other.
+  - On startup prefer AOF if both exist, else RDB.
+TEST
+  - Round-trip: populate every type, SAVE, restart, compare everything.
+  - Corrupt a byte in the file: loader must detect via checksum.
+  - Measure fork() latency stall for 1M, 5M keys; record it.
+DONE WHEN
+  - Round-trip passes for all types and fork stall numbers are recorded.
+
+
+==============================================================================
+STEP 13: BENCHMARKS, PROFILING, OPTIMIZATION                   (2-3 weeks)
+==============================================================================
+BUILD / DO
+  - Scripts that run redis-benchmark against real Redis and your server with
+    identical settings (clients, pipeline depth, payload size, command mix).
+    One session per user means a single "redis-benchmark --user X -c 50" is
+    refused: generate N users and run N benchmark processes with -c 1 each,
+    and do the same against real Redis for fairness. PING needs no AUTH.
+  - Latency measurement: p50, p99, p99.9 (use a histogram, for example
+    HdrHistogram), not just averages.
+  - perf record + flamegraphs; identify the top 3 hot spots.
+  - Try and measure (one change at a time, before/after table):
+      * custom open-addressing hash table for the keyspace
+      * arena or pool allocator for Connection objects and small strings
+      * small-string optimization / avoiding std::string copies
+        (use string_view and move semantics)
+      * batching writes with writev, reducing epoll_ctl calls
+      * prefetching hash buckets for pipelined commands
+      * compact encodings for small hashes/lists/sets (listpack-style)
+      * optional I/O threads for read/write while keeping execution
+        single-threaded
+  - Check cache behavior (perf stat: cache-misses, branch-misses).
+DONE WHEN
+  - You have a table of optimizations with measured gains, and honest numbers
+    versus real Redis (even if you are slower, explain why).
+
+
+==============================================================================
+STEP 14: OPTIONAL EXTENSIONS (pick one or two)
+==============================================================================
+  - Replication: REPLICAOF, full sync (RDB transfer), command stream,
+    replication backlog, partial resync (PSYNC).
+  - Streams: XADD, XRANGE, XREAD, consumer groups (market-data style).
+  - Multi-threaded sharded design: pin each user to one thread, so no locks
+    are needed because users share nothing. Write a tradeoff comparison
+    against the single-threaded version (a hot single user is limited to one
+    core; many users scale with cores). This is the best extension for this
+    scope. Caveat: fork()-based BGSAVE/BGREWRITEAOF is unsafe with several
+    mutating threads (the child can capture a half-finished update), so this
+    extension needs per-shard, non-fork snapshotting. Session claim and
+    handing a connection to its user's thread after AUTH become cross-thread
+    operations.
+  - Lua-free scripting alternative, or a simple module/command plug-in API.
+  - HyperLogLog, bitmaps, geo commands.
+
+
+==============================================================================
+STEP 15: DOCUMENTATION AND PACKAGING                           (3-5 days)
+==============================================================================
+README SHOULD CONTAIN
+  - One-paragraph summary and a feature list (supported commands).
+  - Architecture diagram: event loop -> parser -> dispatcher -> database ->
+    AOF/RDB; plus a class diagram.
+  - Design decisions and tradeoffs (list from Part 1, Section D).
+  - Benchmark tables and latency graphs vs real Redis.
+  - Optimization log (before/after).
+  - Correctness story: differential tests, fuzzing, crash tests, sanitizers.
+  - Known limitations and what you would do next.
+  - Build and run instructions (one command to build, one to run tests).
+REPO HYGIENE
+  - CI (GitHub Actions) running build + tests + sanitizers.
+  - Clean commit history, meaningful commit messages.
+  - A short demo (asciinema or a GIF) of redis-cli talking to your server.
+
+
+==============================================================================
+QUICK CHECKLIST
+==============================================================================
+ [ ] Step 0   Setup
+ [ ] Step 1   Blocking server + PING
+ [ ] Step 2   RESP parser/writer
+ [ ] Step 3   Event loop, many clients
+ [ ] Step 4   Users, AUTH, Database + strings
+ [ ] Step 5   Expiry (lazy + active)
+ [ ] Step 6   Hash, List, Set
+ [ ] Step 7   SkipList + ZSet
+ [ ] Step 8   AOF + crash tests
+ [ ] Step 9   Transactions (optional, no WATCH)
+ [ ] Step 10  Per-user limits + isolation hardening
+ [ ] Step 11  Eviction LRU/LFU
+ [ ] Step 12  RDB snapshots
+ [ ] Step 13  Benchmarks + optimization
+ [ ] Step 14  Optional extension
+ [ ] Step 15  README + CI
+
+==============================================================================
+END OF PART 2
+==============================================================================
