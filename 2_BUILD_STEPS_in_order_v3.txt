@@ -3,8 +3,24 @@ REDIS CLONE IN C++  -  BUILD STEPS IN ORDER
 Part 2: What to build, which classes/structs, which features, how to verify
 ==============================================================================
 
-CHANGES IN THIS REVISION (v2)
+CHANGES IN THIS REVISION (v3)
 -----------------------------
+  - jemalloc is the memory allocator from the very first working build. glibc
+    malloc stays buildable (CMake option ALLOCATOR) for comparison only.
+  - New Step 0B: jemalloc integration, startup self-check, AllocStats, and a
+    standalone allocator micro-benchmark with an A/B runner script.
+  - New Step 7B: allocator A/B memory checkpoint (bytes per key, RSS,
+    fragmentation for every data type, plus a churn test).
+  - Allocator A/B measurements added to Steps 3, 5, 11 and 12.
+  - New Step 13A: the full jemalloc vs glibc benchmark (workloads, metrics,
+    fairness rules, tuning sweep, statistics, report). Original Step 13
+    content is kept as 13B.
+  - Step 15 (README, CI) updated: allocator comparison section, CI matrix over
+    both builds.
+  - Time estimate +1 week.
+
+CHANGES IN REVISION v2
+----------------------
   - No WATCH, and no sharing between any two clients: one live session per
     user. Max-clients limit removed; session claim/release, idle timeout and
     keepalive added.
@@ -27,8 +43,9 @@ Do the steps in order. Each step lists:
 Do not start a step until the previous one's "DONE WHEN" is true. Commit to git
 at the end of every step. Keep a running notes file for the README.
 
-Time: the step estimates below add up to roughly 12 to 18 weeks of focused
-full-time work. Part-time will be longer; 2 to 4 months was optimistic.
+Time: the step estimates below add up to roughly 13 to 19 weeks of focused
+full-time work (v3 added about one week for jemalloc and the A/B steps).
+Part-time will be longer; 2 to 4 months was optimistic.
 
 SCOPE (updated, v2)
 -------------------
@@ -41,6 +58,8 @@ SCOPE (updated, v2)
   - MULTI/EXEC is optional and simple (it adds no isolation here).
   - Assumption: a user is an account selected by AUTH, with data that
     persists across connections and restarts.
+  - Memory allocator: jemalloc is used from the start. glibc is kept as a
+    second build only to benchmark against. Same source, one CMake switch.
 
 
 ==============================================================================
@@ -50,11 +69,65 @@ BUILD
   - CMake project, C++17 or C++20, warnings on (-Wall -Wextra -Wpedantic).
   - Directory layout from Part 1.
   - Test framework (GoogleTest or Catch2).
-  - Build presets: Debug+ASan/UBSan, Release (-O2 -march=native), Profile.
+  - Build presets: Debug+ASan/UBSan (glibc only), Profile, and Release
+    (-O2 -march=native) in TWO flavors: release-jemalloc (default) and
+    release-glibc. The allocator wiring itself is done in Step 0B.
   - Config struct (port 6379 default).
-  - Install redis-server, redis-cli, redis-benchmark for comparison.
+  - Install redis-server, redis-cli, redis-benchmark for comparison, and
+    libjemalloc-dev (used from Step 0B on).
 DONE WHEN
   - An empty main builds in all presets and one dummy test runs.
+
+
+==============================================================================
+STEP 0B: JEMALLOC AS THE ALLOCATOR + A/B HARNESS               (2-3 days)
+==============================================================================
+BUILD
+  - Install jemalloc (libjemalloc-dev) and record its version and your glibc
+    version (ldd --version) in the notes file.
+  - CMake option ALLOCATOR=jemalloc|glibc, default jemalloc. Use
+    find_library or pkg-config. If jemalloc is requested and missing, FAIL the
+    configure step with a clear message (no silent fallback to glibc). Define
+    REDIS_ALLOC_JEMALLOC or REDIS_ALLOC_GLIBC.
+  - Presets: release-jemalloc, release-glibc, asan. The asan preset forces
+    glibc and errors out if ALLOCATOR=jemalloc is combined with a sanitizer.
+  - src/alloc/alloc_stats.h/.cpp: AllocStats (struct) and free functions
+    allocatorName(), allocatorVersion(), readAllocStats(),
+    releaseFreeMemory(). Only this module includes <jemalloc/jemalloc.h> or
+    <malloc.h>. jemalloc: mallctl (advance "epoch", read stats.allocated,
+    stats.active, stats.resident, stats.mapped, stats.retained). glibc:
+    mallinfo2() plus VmRSS from /proc/self/status.
+  - Startup self-check in main(): print "allocator: jemalloc <version>" or
+    "allocator: glibc <version>". The jemalloc build aborts if mallctl("version")
+    fails. The glibc build aborts if jemalloc symbols are present (for
+    example dlsym(RTLD_DEFAULT, "mallctl") is non-null, which happens when
+    someone runs it with LD_PRELOAD=libjemalloc.so). This makes it impossible
+    to mislabel a benchmark result.
+  - bench/allocator/alloc_micro.cpp: standalone micro-benchmark, no server
+    needed. Scenarios:
+      (a) allocate and free many small std::string (16-64 bytes),
+      (b) mixed sizes 16 B to 4 KB with random lifetimes (churn),
+      (c) grow a std::deque and an unordered_map to 1M entries, then free all,
+      (d) repeated growth of a std::string / byte buffer (realloc pattern),
+      (e) fragmentation: allocate 1M objects, free every other one, refill
+          with a different size mix, and compare RSS with live bytes.
+  - bench/allocator/run_ab.sh: builds both presets from the same commit, runs
+    a given binary and arguments on each, N = 10 runs, alternating order
+    (jemalloc, glibc, jemalloc, glibc ...), and writes a CSV with wall time,
+    peak RSS, allocator stats and the git commit. Reused later for the server.
+FEATURES
+  - Same source, two binaries: build/release-jemalloc and build/release-glibc.
+TEST
+  - Prove which allocator is active: self-check line, ldd/nm on the binaries,
+    and MALLOC_CONF=stats_print:true prints a jemalloc stats report at exit
+    for the jemalloc build and nothing for the glibc build.
+  - Run the glibc binary with LD_PRELOAD=libjemalloc.so: the self-check must
+    abort it.
+  - Run alloc_micro through run_ab.sh on both builds; save the CSV.
+DONE WHEN
+  - Both builds compile from one commit, the self-check proves the active
+    allocator, and a micro-benchmark baseline (10 runs per scenario per
+    allocator, median and spread) is saved in bench/results/allocator_micro/.
 
 
 ==============================================================================
@@ -122,6 +195,9 @@ FEATURES
 TEST
   - 1000 concurrent clients doing PING.
   - redis-benchmark -t ping -c 50 -n 100000, with and without -P 16 pipeline.
+  - Repeat that on release-jemalloc and release-glibc through run_ab.sh as a
+    first smoke A/B. Expect almost no difference (PING barely allocates); the
+    point is to prove the harness works end to end before real workloads exist.
   - A client disconnecting mid-command must not leak or crash.
   - Close a client and accept a new one (same fd) inside one epoll_wait
     batch: the new client must not see the old client's event.
@@ -143,7 +219,10 @@ BUILD
     or unordered_map + side vector of keys. Switching later is painful.
   - Database (class): find(), findOrCreate(), erase(), size(), flush().
     ONE INSTANCE PER USER. Tracks used_bytes on every insert/erase/resize
-    (moved here from Step 11: quotas in Step 10 need it). Has a removal sink
+    (moved here from Step 11: quotas in Step 10 need it). Count LOGICAL sizes
+    (key bytes + value bytes + fixed per-object overhead), not
+    malloc_usable_size(), so quotas and eviction behave identically on the
+    jemalloc and glibc builds. Has a removal sink
     (callback) fired when a key is removed by lazy expiry, active expiry or
     eviction, so Step 8 can log DELs.
   - User (struct): { id, name, password hash, Database db, quota,
@@ -156,6 +235,9 @@ BUILD
   - cmd_string.cpp handlers.
   - cmd_keys.cpp: DEL, EXISTS, TYPE, DBSIZE, FLUSHALL, KEYS, SCAN, RENAME.
   - cmd_server.cpp: ECHO, INFO (minimal for now), CONFIG GET (minimal).
+    INFO already has a memory section: allocator name/version, used_bytes,
+    allocator allocated, allocator resident, process RSS, fragmentation ratio
+    (from AllocStats, Step 0B).
 FEATURES
   - AUTH <user> <password>: binds the connection to that user's Database and
     claims the user's single session. If the user already has a live session
@@ -214,6 +296,9 @@ TEST
   - Also measure the stall of DEL on one huge container (for example a set of
     1M members). The active-expiry budget does not cover freeing big values;
     note the result and consider incremental/lazy freeing.
+  - Run both stall measurements (1M expiring keys, DEL of a 1M-member set) on
+    release-jemalloc AND release-glibc, and record the max stall and the RSS
+    after the free for each. Big frees are an allocator workload.
 DONE WHEN
   - Expiry is correct (lazy and active) and the max stall is measured and
     recorded for the README.
@@ -268,6 +353,42 @@ TEST
   - Micro-benchmark: insert 1M members, measure ZADD and ZRANK latency.
 DONE WHEN
   - Property and differential tests pass; you can explain span-based rank.
+
+
+==============================================================================
+STEP 7B: ALLOCATOR A/B MEMORY CHECKPOINT                       (2-3 days)
+==============================================================================
+Why here: all five value types now exist, so memory behavior can be measured
+on realistic data before AOF, eviction and optimizations change the picture.
+BUILD
+  - bench/allocator/mem_profile.sh plus a small load generator (C++ or
+    Python, pipelined, one user per process) that fills the server and then
+    calls INFO and reads /proc/<pid>/status after each phase.
+  - Workloads (same data and seed for both builds):
+      W1  1M string keys, 16 B keys, 64 B values
+      W2  1M string keys, 256 B and then 1 KB values
+      W3  100k hashes with 10 fields each
+      W4  100k lists with 100 elements each
+      W5  100k sets with 50 members each
+      W6  10 sorted sets with 100k members each
+      W7  churn: fill 1M keys, then 3 rounds of {overwrite 50 percent with a
+          different value size, delete 30 percent, refill}
+      W8  free everything (FLUSHALL, DEL on big containers) and check how much
+          RSS is handed back to the OS
+  - Record after every phase: used_bytes (own accounting), allocator
+    allocated, allocator resident, process RSS, fragmentation ratio, and
+    bytes per key.
+  - Run the same workloads against real Redis (used_memory, used_memory_rss).
+TEST
+  - Both builds return identical logical data (a type-aware scan matches),
+    so the allocator changes nothing observable.
+  - used_bytes is within the documented tolerance of the allocator's allocated
+    figure on both builds; investigate if not.
+DONE WHEN
+  - A table (workload x allocator: RSS, fragmentation ratio, bytes/key, RSS
+    after free) is saved in bench/results/allocator_mem/, with a short
+    written finding. Note any data type that is memory-heavy (for example
+    unordered_map nodes) as input for Step 13B compact encodings.
 
 
 ==============================================================================
@@ -406,6 +527,10 @@ TEST
     check the hot keys survive more often under LRU/LFU than random eviction.
   - Experiment: vary sample size (3, 5, 10) and plot hit rate vs sample size.
     This graph is great README material.
+  - Allocator angle: run the fill-to-maxmemory test with a mixed-size churn
+    on both builds and record RSS versus maxmemory over time. Eviction bounds
+    used_bytes, not RSS; the fragmentation ratio shows how far RSS overshoots
+    on each allocator.
 DONE WHEN
   - Memory stays near the limit under load; hit-rate experiment recorded.
 
@@ -430,13 +555,98 @@ TEST
   - Round-trip: populate every type, SAVE, restart, compare everything.
   - Corrupt a byte in the file: loader must detect via checksum.
   - Measure fork() latency stall for 1M, 5M keys; record it.
+  - Do this on release-jemalloc AND release-glibc. Also record child
+    copy-on-write growth (Private_Dirty in /proc/<child>/smaps_rollup) while
+    the parent keeps writing, and the p99 / p99.9 latency of clients during
+    the child's lifetime. Allocator layout and background purging in the
+    parent can change these numbers.
 DONE WHEN
   - Round-trip passes for all types and fork stall numbers are recorded.
 
 
 ==============================================================================
-STEP 13: BENCHMARKS, PROFILING, OPTIMIZATION                   (2-3 weeks)
+STEP 13: BENCHMARKS, PROFILING, OPTIMIZATION                   (3-4 weeks)
 ==============================================================================
+13A. ALLOCATOR A/B BENCHMARK  (jemalloc vs glibc)
+-------------------------------------------------
+Contenders (three rows in every table):
+  1. your server + jemalloc   (build/release-jemalloc)
+  2. your server + glibc      (build/release-glibc)
+  3. real Redis (note its allocator from INFO memory: mem_allocator; if you can
+     build it with MALLOC=libc add a fourth row)
+Both of your builds come from the SAME commit with identical flags and config.
+
+Environment control (record all of it in the results folder):
+  - Pin the server and the load generators to different cores (taskset).
+  - CPU governor "performance"; note turbo on/off.
+  - Same machine, nothing else running. Loopback is fine, but say so.
+  - Transparent huge pages: record /sys/kernel/mm/transparent_hugepage/enabled
+    and run with the same setting for every contender (THP strongly affects
+    RSS and allocator behavior).
+  - Fresh server start per run, warm-up phase discarded, same dataset and seed.
+  - Save lscpu, kernel version, glibc version, jemalloc version, MALLOC_CONF,
+    and the git commit next to every result.
+
+Workloads (each on every contender):
+  W-A  GET/SET mix 90/10 and 50/50, payloads 16 B, 256 B, 4 KB, pipeline 1 and
+       16. With one session per user, use N processes of -c 1, one user each,
+       N in {1, 4, 16}. Same N for real Redis.
+  W-B  Type-heavy: HSET/HGET, LPUSH/LRANGE, SADD/SISMEMBER, ZADD/ZRANK on a
+       1M-member sorted set.
+  W-C  Churn soak (30 to 60 minutes): mixed value sizes, TTLs, overwrites and
+       eviction at maxmemory. Sample RSS, used_bytes and fragmentation ratio
+       every 10 seconds. Graph RSS and fragmentation versus time.
+  W-D  Big free: DEL / UNLINK of a 1M-member set and FLUSHALL. Record the
+       longest event-loop stall and the RSS afterward.
+  W-E  Persistence interaction: BGSAVE and BGREWRITEAOF while writing. Record
+       fork stall, client latency during the child, and child COW growth.
+  W-F  Expiry storm: 1M keys expiring at the same moment. Record the longest
+       stall.
+
+Metrics:
+  - Throughput (ops/s); latency p50 / p99 / p99.9 / max from a histogram
+    (HdrHistogram), not averages.
+  - Steady and peak RSS, fragmentation ratio, bytes per key.
+  - page-faults and minor-faults (perf stat), cache-misses, and the share of
+    CPU time spent in malloc/free (jemalloc je_* or arena functions, glibc
+    _int_malloc/_int_free) from perf record.
+  - Allocation counts (jemalloc stats nmalloc/ndalloc; for glibc use a perf
+    uprobe on malloc or ltrace on a short run).
+
+Statistics and fairness:
+  - At least 10 runs per cell (at least 5 for the soak), alternating the
+    order of the contenders each round to cancel drift (thermal, cache, page
+    cache).
+  - Report the median plus min/max (or a confidence interval). If the
+    difference is within run-to-run noise, write "no measurable difference".
+    Never report a single run.
+  - Tuning sweep AFTER the default-settings baseline, one knob at a time:
+      jemalloc: dirty_decay_ms (0, 1000, default), muzzy_decay_ms, narenas
+                (1 vs default), background_thread (false/true), tcache.
+      glibc   : MALLOC_ARENA_MAX=1, MALLOC_MMAP_THRESHOLD_,
+                MALLOC_TRIM_THRESHOLD_, and malloc_trim(0) from serverCron
+                after large frees.
+    Report defaults AND best-tuned for BOTH allocators, so glibc is not
+    compared in an untuned state against a tuned jemalloc.
+  - Do the 13B optimizations on the jemalloc build first. At the end re-run
+    the final build on glibc as well and mark which gains depend on the
+    allocator (arena/pool allocators and string-copy removal are the likely
+    ones).
+
+Scripts and output:
+  - bench/allocator/run_matrix.sh loops over builds x workloads x runs and
+    writes CSV; bench/allocator/plot.py draws the graphs. Results go to
+    bench/results/allocator/<date>/.
+
+DONE WHEN (13A)
+  - You have: a throughput + latency percentile table, an RSS/fragmentation
+    versus time graph, and the big-free / fork / expiry stall table, for both
+    allocators and real Redis, plus a written conclusion saying which
+    allocator is the default and why, backed by the numbers (including
+    "no significant difference, kept jemalloc because ...").
+
+13B. GENERAL BENCHMARKS, PROFILING, OPTIMIZATION
+------------------------------------------------
 BUILD / DO
   - Scripts that run redis-benchmark against real Redis and your server with
     identical settings (clients, pipeline depth, payload size, command mix).
@@ -449,6 +659,8 @@ BUILD / DO
   - Try and measure (one change at a time, before/after table):
       * custom open-addressing hash table for the keyspace
       * arena or pool allocator for Connection objects and small strings
+        (measure on top of jemalloc; its thread cache already makes small
+        allocations cheap, so expect a smaller gain than against glibc)
       * small-string optimization / avoiding std::string copies
         (use string_view and move semantics)
       * batching writes with writev, reducing epoll_ctl calls
@@ -459,7 +671,8 @@ BUILD / DO
   - Check cache behavior (perf stat: cache-misses, branch-misses).
 DONE WHEN
   - You have a table of optimizations with measured gains, and honest numbers
-    versus real Redis (even if you are slower, explain why).
+    versus real Redis (even if you are slower, explain why). The 13A allocator
+    comparison is finished and its conclusion is written down.
 
 
 ==============================================================================
@@ -476,7 +689,8 @@ STEP 14: OPTIONAL EXTENSIONS (pick one or two)
     mutating threads (the child can capture a half-finished update), so this
     extension needs per-shard, non-fork snapshotting. Session claim and
     handing a connection to its user's thread after AUTH become cross-thread
-    operations.
+    operations. Re-run the allocator A/B (Step 13A) here: arena contention
+    across threads is where jemalloc and glibc differ the most.
   - Lua-free scripting alternative, or a simple module/command plug-in API.
   - HyperLogLog, bitmaps, geo commands.
 
@@ -491,11 +705,15 @@ README SHOULD CONTAIN
   - Design decisions and tradeoffs (list from Part 1, Section D).
   - Benchmark tables and latency graphs vs real Redis.
   - Optimization log (before/after).
+  - Allocator comparison (jemalloc vs glibc): why jemalloc is the default,
+    method, tables, RSS/fragmentation graph, tuning results, conclusion, and
+    how to build each variant (-DALLOCATOR=jemalloc|glibc).
   - Correctness story: differential tests, fuzzing, crash tests, sanitizers.
   - Known limitations and what you would do next.
   - Build and run instructions (one command to build, one to run tests).
 REPO HYGIENE
-  - CI (GitHub Actions) running build + tests + sanitizers.
+  - CI (GitHub Actions) running build + tests on a matrix of ALLOCATOR=
+    jemalloc and glibc, plus sanitizers (glibc only).
   - Clean commit history, meaningful commit messages.
   - A short demo (asciinema or a GIF) of redis-cli talking to your server.
 
@@ -504,6 +722,7 @@ REPO HYGIENE
 QUICK CHECKLIST
 ==============================================================================
  [ ] Step 0   Setup
+ [ ] Step 0B  jemalloc + allocator A/B harness
  [ ] Step 1   Blocking server + PING
  [ ] Step 2   RESP parser/writer
  [ ] Step 3   Event loop, many clients
@@ -511,15 +730,16 @@ QUICK CHECKLIST
  [ ] Step 5   Expiry (lazy + active)
  [ ] Step 6   Hash, List, Set
  [ ] Step 7   SkipList + ZSet
+ [ ] Step 7B  Allocator A/B memory checkpoint
  [ ] Step 8   AOF + crash tests
  [ ] Step 9   Transactions (optional, no WATCH)
  [ ] Step 10  Per-user limits + isolation hardening
  [ ] Step 11  Eviction LRU/LFU
  [ ] Step 12  RDB snapshots
- [ ] Step 13  Benchmarks + optimization
+ [ ] Step 13  Benchmarks + optimization (13A: jemalloc vs glibc A/B)
  [ ] Step 14  Optional extension
  [ ] Step 15  README + CI
 
 ==============================================================================
-END OF PART 2
+END OF PART 2 (v3)
 ==============================================================================

@@ -3,8 +3,24 @@ REDIS CLONE IN C++  -  DESIGN DOCUMENT
 Part 1: Features and Project Structure
 ==============================================================================
 
-CHANGES IN THIS REVISION (v2)
+CHANGES IN THIS REVISION (v3)
 -----------------------------
+  - Decision: the server uses jemalloc as its memory allocator FROM THE START
+    (first commit), instead of the default glibc malloc. glibc stays
+    buildable behind one CMake switch (-DALLOCATOR=jemalloc|glibc) so every
+    measurement can be repeated on both builds from the same source.
+  - New: src/alloc/ module (AllocStats), new Section C8 (memory allocator),
+    allocator decisions in Section D, allocator tests in Section E.
+  - Memory accounting (used_bytes) counts LOGICAL sizes so quotas and
+    eviction behave the same on both builds; allocator statistics (allocated,
+    resident, fragmentation) are reported separately in INFO.
+  - Sanitizer builds always use glibc (ASan replaces malloc; it cannot be
+    combined with jemalloc).
+  - Benchmark plan extended: an allocator A/B comparison (jemalloc vs glibc)
+    is part of the testing plan. Procedure is in Part 2 (Steps 0B, 7B, 13A).
+
+CHANGES IN REVISION v2
+----------------------
   - Decision: no WATCH and NO sharing of data between any two clients, not
     even two clients of the same user. A user has at most ONE live session
     (one authenticated connection) at a time.
@@ -42,6 +58,10 @@ SCOPE DECISIONS (updated, v2)
   - MULTI/EXEC is kept as an optional, simple feature. With no sharing it
     gives no extra isolation; its value is all-or-nothing queue abort and
     contiguous AOF logging. Say so honestly in the README.
+  - Memory allocator (v3): jemalloc is the default allocator from the first
+    commit. glibc malloc remains selectable at build time only for A/B
+    benchmarking (see C8). The allocator is a build-time choice, not a runtime
+    config option.
 
 RULE FOR STRUCT vs CLASS
 ------------------------
@@ -55,7 +75,8 @@ SECTION A: PROJECT DIRECTORY LAYOUT
 ==============================================================================
 
 redis-clone/
-  CMakeLists.txt
+  CMakeLists.txt            option ALLOCATOR=jemalloc|glibc (default jemalloc)
+  cmake/                    FindJemalloc.cmake (or pkg-config helper)
   README.md                 (design decisions, benchmarks, tradeoffs)
   src/
     main.cpp
@@ -105,8 +126,15 @@ redis-clone/
       eviction_policy.h     EvictionPolicy (abstract)
       approx_lru.h/.cpp     ApproxLru
       approx_lfu.h/.cpp     ApproxLfu
+    alloc/
+      alloc_stats.h/.cpp    AllocStats, allocator name/version, stats reader
+                            (the ONLY files allowed to include jemalloc.h
+                            or malloc.h)
   tests/                    unit tests, fuzz tests, differential tests
   bench/                    benchmark scripts, results, graphs
+    allocator/              alloc_micro.cpp, run_ab.sh, run_matrix.sh,
+                            mem_profile.sh, plot.py  (jemalloc vs glibc)
+    results/                CSVs + machine info, one folder per run date
   docs/                     design notes, latency analysis
 
 
@@ -230,6 +258,17 @@ EvictionPolicy(abstract class)  onAccess(key, obj), pickVictim(db).
 ApproxLru     (class)   Samples N random keys, evicts the least recently used.
 ApproxLfu     (class)   Samples N keys, uses a logarithmic counter with decay,
                         evicts the least frequently used.
+
+MEMORY ALLOCATOR  (v3)
+-----------------------
+AllocStats    (struct)  Plain snapshot: { allocated, active, resident, mapped,
+                        retained (jemalloc), or the closest glibc equivalents
+                        from mallinfo2() and /proc/self/statm }. Passive data.
+Free functions in alloc_stats.h: allocatorName(), allocatorVersion(),
+              readAllocStats(), releaseFreeMemory() (jemalloc: purge decayed
+              pages; glibc: malloc_trim(0)). No class: there is no state to
+              protect, and the functions compile differently per build
+              (REDIS_ALLOC_JEMALLOC or REDIS_ALLOC_GLIBC).
 
 CONFIG
 ------
@@ -429,6 +468,12 @@ Memory accounting:
   - Track approximate used bytes: key size + value size + per-object
     overhead. Update on every insert, delete and resize. Exact accounting is
     not required but must be consistent and documented.
+  - Count LOGICAL sizes (key bytes + value bytes + fixed per-object
+    overhead), NOT malloc_usable_size(). Then quotas and eviction decisions
+    are identical on the jemalloc and glibc builds and the A/B comparison
+    changes only the allocator. Report the allocator's own numbers (allocated,
+    resident) separately in INFO and use them as an accuracy check on
+    used_bytes (see C8).
   - Run the eviction check before executing each command flagged denyoom;
     evict in a loop until under the limit (or no victim is available, then
     return -OOM). Shrinking commands (DEL, UNLINK, EXPIRE...) must never be
@@ -455,6 +500,76 @@ C7. NETWORKING / EVENT LOOP
   - Set TCP_NODELAY on client sockets.
   - A periodic timer (serverCron, for example every 100 ms) drives active
     expiry, AOF everysec fsync, BGSAVE child reaping and stats.
+
+
+C8. MEMORY ALLOCATOR  (jemalloc first, glibc kept for comparison)
+------------------------------------------------------------------
+Decision: all heap memory (std::string, std::deque, unordered_map, skip list
+nodes, buffers) is served by jemalloc. glibc malloc (ptmalloc2) is the
+alternative build, used for measurement.
+Why jemalloc (to be CONFIRMED by your own numbers, not assumed):
+  - Size classes and thread caches usually give lower fragmentation under
+    long-running mixed-size churn (the exact workload of a cache with TTLs,
+    overwrites and eviction).
+  - Predictable return of memory to the OS (decay-based purging) and a
+    smaller gap between "bytes the app holds" and "RSS".
+  - Better scalability if I/O threads or the sharded design (Step 14) are
+    added later.
+  - Built-in statistics (mallctl) and heap profiling (opt.prof, jeprof).
+  - Real Redis uses jemalloc by default on Linux, so using it removes an
+    unfair difference when you compare against real Redis.
+Costs to document honestly:
+  - Extra dependency and build complexity.
+  - Cannot be combined with ASan/TSan/Valgrind (they replace malloc).
+    Sanitizer presets use glibc. Heap profiling on the jemalloc build uses
+    jemalloc's own profiler instead of heaptrack/valgrind.
+  - Its own background thread (if enabled) and its fork() behavior need to be
+    understood (see below).
+Integration method (pick one and document it):
+  A. Link-time replacement (recommended first): link libjemalloc so its
+     malloc/free/calloc/realloc/posix_memalign take over. libstdc++'s
+     operator new calls malloc, so every C++ allocation goes through
+     jemalloc with no source change. Add a startup self-check (mallctl
+     "version" must succeed in the jemalloc build, and must NOT be resolvable
+     in the glibc build) so a silent fallback can never mislabel a benchmark.
+  B. Prefixed jemalloc (je_malloc) plus your own zmalloc-style wrapper and
+     global operator new/delete overrides. Gives exact per-allocation
+     accounting and full control, at the price of more code. Optional later.
+Build rules:
+  - One CMake option, ALLOCATOR=jemalloc|glibc, default jemalloc. If jemalloc
+    is requested and not found, configuration FAILS (no silent fallback).
+  - Both builds use identical flags otherwise (-O2 -march=native, same
+    compiler), so differences come from the allocator only.
+  - Sanitizer presets force glibc and reject ALLOCATOR=jemalloc.
+Statistics and INFO:
+  - INFO memory shows: allocator name and version, used_bytes (own logical
+    accounting), allocator allocated, allocator resident, process RSS, and
+    fragmentation ratio = resident / allocated (and RSS / used_bytes).
+  - jemalloc statistics are cached: advance mallctl "epoch" before reading.
+  - Keep used_bytes allocator independent (see C6) and compare it with the
+    allocator's allocated figure to catch accounting bugs.
+Tuning knobs (benchmark defaults first, then one knob at a time):
+  jemalloc : background_thread (default OFF here, to keep the server
+             single-threaded and fork-simple), dirty_decay_ms,
+             muzzy_decay_ms, narenas, tcache. Set through MALLOC_CONF or an
+             embedded malloc_conf string.
+  glibc    : MALLOC_ARENA_MAX, M_MMAP_THRESHOLD, M_TRIM_THRESHOLD,
+             M_TOP_PAD, and malloc_trim(0) after large frees.
+Interactions to measure, not guess:
+  - fork() for BGSAVE / BGREWRITEAOF: jemalloc registers fork handlers so it
+    works, but memory layout and background purging in the parent while a
+    child exists can change copy-on-write growth. Measure fork stall and COW
+    growth on both builds (Step 12, Step 13A).
+  - Freeing huge containers (DEL of a 1M-member set, FLUSHALL) is an
+    allocator workload. Measure the stall on both builds (Step 5, 13A).
+  - Eviction bounds used_bytes, not RSS. Fragmentation decides how far RSS
+    overshoots maxmemory; compare both builds under churn (Step 11, 13A).
+  - A custom arena/pool allocator (Step 13) must be measured ON TOP of
+    jemalloc, where small allocations are already cheap thanks to tcache.
+Comparing with real Redis: check "mem_allocator" in real Redis's INFO. If it
+is jemalloc, compare yours-jemalloc against it for design differences, and
+compare yours-glibc as a separate row. If you can build Redis with
+MALLOC=libc, add that row too.
 
 
 ==============================================================================
@@ -486,6 +601,12 @@ SECTION D: KEY DESIGN DECISIONS (be ready to defend these in interviews)
   13. One live session per user vs many sessions per user: simpler (no data
       races between clients, no WATCH), at the cost that a client cannot
       open a connection pool for one account.
+  14. jemalloc vs glibc malloc (v3): fragmentation and RSS under churn, tail
+      latency, throughput, and cost (dependency, no ASan, fork interaction).
+      Be ready to show YOUR measurements from the A/B benchmark, including
+      the case where the difference is small or glibc wins on some workload.
+  15. Link-time allocator replacement vs prefixed jemalloc with an explicit
+      wrapper: simplicity vs exact accounting and control.
 
 
 ==============================================================================
@@ -511,15 +632,28 @@ SECTION E: TESTING AND MEASUREMENT PLAN
     simulation (VM hard reset, dm-flakey, or an LD_PRELOAD shim that drops
     unsynced writes).
   - Sanitizers: build and test with ASan, UBSan and TSan (if threaded).
+    These run on the glibc build only (sanitizers replace malloc).
+  - Allocator tests (v3): the whole unit, fuzz and differential suite must
+    pass on BOTH builds (CI matrix on ALLOCATOR). The startup self-check must
+    prove which allocator is active. used_bytes must stay within a documented
+    tolerance of the allocator's allocated figure on both builds.
   - Benchmarks: redis-benchmark against both servers, with and without
     pipelining. Report throughput and p50 / p99 / p99.9 latency. With one
     session per user, a single "redis-benchmark --user X -c 50" is refused:
     run N benchmark processes with -c 1, one user each (and the same N
     processes against real Redis for fairness). PING needs no AUTH.
+    Run every benchmark on both allocator builds (yours+jemalloc,
+    yours+glibc) plus real Redis; see Step 13A for the full method.
+  - Allocator A/B (v3): micro-benchmark, memory-per-key checkpoint, churn
+    soak (RSS and fragmentation vs time), big-free stall, fork/COW growth,
+    and expiry-storm stall, each repeated at least 10 times with alternating
+    run order and reported as median plus spread.
   - Profiling: perf and flamegraphs, with a before/after table for each
     optimization.
-  - Valgrind or heaptrack for memory leaks and allocation counts.
+  - Valgrind or heaptrack for memory leaks and allocation counts (glibc
+    build only). On the jemalloc build use its stats (mallctl, MALLOC_CONF=
+    stats_print:true) and opt.prof with jeprof for heap profiles.
 
 ==============================================================================
-END OF PART 1
+END OF PART 1 (v3)
 ==============================================================================
