@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -51,13 +52,13 @@ InternalStatus parseLine(std::string_view input, std::size_t& position,
             error = "carriage return is not followed by line feed";
             return InternalStatus::Error;
         }
-        if (i - start >= limits.maxCommandBytes) {
+        if (i >= limits.maxCommandBytes) {
             error = "command exceeds configured byte limit";
             return InternalStatus::Error;
         }
     }
 
-    if (input.size() - start > limits.maxCommandBytes) {
+    if (input.size() > limits.maxCommandBytes) {
         error = "command exceeds configured byte limit";
         return InternalStatus::Error;
     }
@@ -182,7 +183,11 @@ InternalResult parseValue(std::string_view input, std::size_t& position,
                 position > limits.maxCommandBytes - bulkLength) {
                 return {InternalStatus::Error, {}, "command exceeds configured byte limit"};
             }
-            if (input.size() - position < bulkLength + kCrlf.size()) {
+            if (kCrlf.size() > limits.maxCommandBytes - position - bulkLength) {
+                return {InternalStatus::Error, {}, "command exceeds configured byte limit"};
+            }
+            const std::size_t available = input.size() - position;
+            if (bulkLength > available || available - bulkLength < kCrlf.size()) {
                 return {InternalStatus::NeedMoreData, {}, {}};
             }
             const std::size_t trailingPosition = position + bulkLength;
@@ -201,8 +206,6 @@ InternalResult parseValue(std::string_view input, std::size_t& position,
             return {InternalStatus::Error, {}, "array exceeds configured limit"};
         }
         RespValue::Array values;
-        values.reserve(std::min(static_cast<std::size_t>(unsignedLength),
-                                (input.size() - position) / 3));
         for (std::uint64_t i = 0; i < unsignedLength; ++i) {
             InternalResult child = parseValue(input, position, depth + 1, limits);
             if (child.status != InternalStatus::Complete) {
@@ -260,6 +263,16 @@ void writeRespValue(Buffer& output, const RespValue& value, std::size_t depth) {
 void Buffer::append(std::string_view data) {
     if (data.empty()) {
         return;
+    }
+    if (!storage_.empty()) {
+        const char* const storageBegin = storage_.data();
+        const char* const storageEnd = storageBegin + storage_.size();
+        const std::less<const char*> less;
+        if (!less(data.data(), storageBegin) && less(data.data(), storageEnd)) {
+            const std::string copy(data);
+            append(copy);
+            return;
+        }
     }
     makeWritable(data.size());
     std::copy(data.begin(), data.end(), storage_.begin() +

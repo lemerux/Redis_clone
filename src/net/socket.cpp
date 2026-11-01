@@ -4,7 +4,9 @@
 #include <system_error>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -44,6 +46,24 @@ Socket Socket::createTcp() {
     return Socket(fd);
 }
 
+int Socket::nativeHandle() const noexcept {
+    return fd_;
+}
+
+void Socket::setNonBlocking() const {
+    const int flags = ::fcntl(fd_, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+        throwSocketError("fcntl");
+    }
+}
+
+void Socket::setTcpNoDelay() const {
+    const int enabled = 1;
+    if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0) {
+        throwSocketError("setsockopt TCP_NODELAY");
+    }
+}
+
 void Socket::bindIpv4Any(unsigned short port) const {
     const int reuseAddress = 1;
     if (::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &reuseAddress,
@@ -74,7 +94,7 @@ Socket Socket::accept() const {
     return Socket(clientFd);
 }
 
-ssize_t Socket::read(char* buffer, std::size_t capacity) const {
+ssize_t Socket::readSome(char* buffer, std::size_t capacity) const {
     ssize_t bytesRead;
     do {
         bytesRead = ::recv(fd_, buffer, capacity, 0);
@@ -86,16 +106,26 @@ ssize_t Socket::read(char* buffer, std::size_t capacity) const {
     return bytesRead;
 }
 
+ssize_t Socket::writeSome(const char* data, std::size_t size) const {
+    ssize_t bytesWritten;
+    do {
+        bytesWritten = ::send(fd_, data, size, MSG_NOSIGNAL);
+    } while (bytesWritten < 0 && errno == EINTR);
+
+    if (bytesWritten < 0) {
+        throwSocketError("send");
+    }
+    return bytesWritten;
+}
+
+ssize_t Socket::read(char* buffer, std::size_t capacity) const {
+    return readSome(buffer, capacity);
+}
+
 void Socket::writeAll(const char* data, std::size_t size) const {
     std::size_t written = 0;
     while (written < size) {
-        const ssize_t result = ::send(fd_, data + written, size - written, MSG_NOSIGNAL);
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        if (result < 0) {
-            throwSocketError("send");
-        }
+        const ssize_t result = writeSome(data + written, size - written);
         if (result == 0) {
             throw std::system_error(EPIPE, std::generic_category(), "send");
         }

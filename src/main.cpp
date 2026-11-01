@@ -1,4 +1,4 @@
-#include "net/socket.h"
+#include "net/event_loop.h"
 
 #include <cerrno>
 #include <csignal>
@@ -33,14 +33,6 @@ unsigned short parsePort(int argc, char* argv[]) {
     return static_cast<unsigned short>(port);
 }
 
-void serveClient(redis_clone::Socket client) {
-    char buffer[4096];
-    if (client.read(buffer, sizeof(buffer)) == 0) {
-        return;
-    }
-    client.writeAll("+PONG\r\n", 7);
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -54,20 +46,11 @@ int main(int argc, char* argv[]) {
         }
 
         const unsigned short port = parsePort(argc, argv);
-        redis_clone::Socket server = redis_clone::Socket::createTcp();
-        server.bindIpv4Any(port);
-        server.listen(16);
+        redis_clone::EventLoop eventLoop(port);
         std::cout << "Listening on port " << port << std::endl;
 
         while (!stopping) {
-            try {
-                serveClient(server.accept());
-            } catch (const std::system_error& error) {
-                if (error.code().value() == EINTR && stopping) {
-                    break;
-                }
-                std::cerr << "Client connection failed: " << error.what() << '\n';
-            }
+            eventLoop.runOnce();
         }
     } catch (const std::exception& error) {
         std::cerr << "Server failed: " << error.what() << '\n';

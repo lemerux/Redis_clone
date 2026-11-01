@@ -1,6 +1,8 @@
 #include "resp/resp.h"
 
+#include <algorithm>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,35 +45,60 @@ RespValue::Array command(std::initializer_list<std::string> arguments) {
 }
 
 void testIncrementalParsing() {
-    const std::string encoded = "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n";
-    const auto expected = command({"ECHO", "hello"});
+    const std::string encoded =
+        "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n"
+        "*1\r\n$4\r\nPING\r\n"
+        "*2\r\n$3\r\nGET\r\n$1\r\nx\r\n";
     RespParser parser;
 
-    for (std::size_t split = 0; split <= encoded.size(); ++split) {
+    const auto parseWithChunks = [&](const std::vector<std::size_t>& chunks) {
         Buffer buffer;
-        buffer.append(std::string_view(encoded).substr(0, split));
-        if (split < encoded.size()) {
-            expect(parser.parse(buffer).status == ParseStatus::NeedMoreData,
-                   "partial command should need more data");
-        }
-        buffer.append(std::string_view(encoded).substr(split));
-        expectCommand(parser, buffer, expected);
-        expect(buffer.empty(), "parsed command bytes should be consumed");
-    }
+        Buffer parsedOutput;
+        std::size_t offset = 0;
+        std::size_t chunkIndex = 0;
+        while (offset < encoded.size()) {
+            const std::size_t chunkSize =
+                std::min(chunks[chunkIndex++ % chunks.size()], encoded.size() - offset);
+            buffer.append(std::string_view(encoded).substr(offset, chunkSize));
+            offset += chunkSize;
 
-    Buffer bytewise;
-    for (std::size_t i = 0; i < encoded.size(); ++i) {
-        const char byte = encoded[i];
-        bytewise.append(std::string_view(&byte, 1));
-        const auto result = parser.parse(bytewise);
-        if (i + 1 < encoded.size()) {
-            expect(result.status == ParseStatus::NeedMoreData,
-                   "bytewise input should remain incomplete until complete");
-        } else {
-            expect(result.status == ParseStatus::Command,
-                   "bytewise input should produce a command");
+            while (!buffer.empty()) {
+                const auto result = parser.parse(buffer);
+                if (result.status == ParseStatus::NeedMoreData) {
+                    break;
+                }
+                expect(result.status == ParseStatus::Command,
+                       "valid chunked input should not produce a protocol error");
+                if (std::get_if<RespValue::Array>(&result.value.data) == nullptr) {
+                    throw std::runtime_error("expected a command array");
+                }
+                redis_clone::RespWriter::writeValue(parsedOutput, result.value);
+            }
         }
+        while (!buffer.empty()) {
+            const auto result = parser.parse(buffer);
+            if (result.status == ParseStatus::NeedMoreData) {
+                break;
+            }
+            expect(result.status == ParseStatus::Command,
+                   "valid input should not produce a protocol error");
+            redis_clone::RespWriter::writeValue(parsedOutput, result.value);
+        }
+        expect(buffer.empty(), "complete input should leave no buffered bytes");
+        expect(parsedOutput.readable() == encoded,
+               "chunked input produced different parsed commands");
+    };
+
+    parseWithChunks({1});
+    parseWithChunks({encoded.size()});
+    parseWithChunks({2, 7, 1, 13, 4, 3, 11});
+
+    std::mt19937 random(0x5EED);
+    std::vector<std::size_t> randomChunks;
+    for (int i = 0; i < 32; ++i) {
+        randomChunks.push_back(1 + random() % 17);
     }
+    parseWithChunks(randomChunks);
 }
 
 void testPipelining() {
@@ -136,13 +163,83 @@ void testErrorsAndLimits() {
     expect(parser.parse(invalid).status == ParseStatus::ProtocolError,
            "negative bulk length below -1 should fail");
 
+    Buffer oversizedDefaultBulk;
+    oversizedDefaultBulk.append("$536870913\r\n");
+    expect(parser.parse(oversizedDefaultBulk).status == ParseStatus::ProtocolError,
+           "bulk string above the default 512 MiB limit should fail");
+
+    Buffer oversizedArray;
+    oversizedArray.append("*1000001\r\n");
+    expect(parser.parse(oversizedArray).status == ParseStatus::ProtocolError,
+           "array above the default one-million element limit should fail");
+    Buffer incompleteMaximumArray;
+    incompleteMaximumArray.append("*1000000\r\n");
+    expect(parser.parse(incompleteMaximumArray).status == ParseStatus::NeedMoreData,
+           "maximum-sized array header should wait for elements without preallocating them");
+
     redis_clone::RespLimits limits;
-    limits.maxBulkLength = 3;
+    limits.maxBulkLength = 3 * 1024 * 1024;
+    limits.maxCommandBytes = limits.maxBulkLength + 64;
     RespParser limitedParser(limits);
-    Buffer oversized;
-    oversized.append("$4\r\n");
-    expect(limitedParser.parse(oversized).status == ParseStatus::ProtocolError,
-           "oversized bulk string should fail before payload arrives");
+    Buffer acceptedBulkLength;
+    acceptedBulkLength.append("$3145728\r\n");
+    expect(limitedParser.parse(acceptedBulkLength).status == ParseStatus::NeedMoreData,
+           "bulk length at the configured 3 MiB test limit should be accepted");
+    Buffer oversizedBulk;
+    oversizedBulk.append("$3145729\r\n");
+    expect(limitedParser.parse(oversizedBulk).status == ParseStatus::ProtocolError,
+           "bulk string above the configured 3 MiB test limit should fail");
+
+    redis_clone::RespLimits smallCommand;
+    smallCommand.maxCommandBytes = 8;
+    RespParser smallCommandParser(smallCommand);
+    Buffer partialOversizedLine;
+    partialOversizedLine.append("*1\r\n+12345");
+    expect(smallCommandParser.parse(partialOversizedLine).status ==
+               ParseStatus::ProtocolError,
+           "incomplete nested line must respect the total command byte limit");
+
+    Buffer impossibleBulk;
+    impossibleBulk.append("$3\r\n");
+    expect(smallCommandParser.parse(impossibleBulk).status == ParseStatus::ProtocolError,
+           "bulk header whose payload and terminator exceed the limit should fail early");
+}
+
+void testBufferSelfAppend() {
+    Buffer buffer;
+    buffer.append(std::string(60, 'a'));
+    buffer.consume(50);
+    const std::string_view readable = buffer.readable();
+    buffer.append(readable);
+    expect(buffer.readable() == std::string(20, 'a'),
+           "appending the buffer's readable view should preserve its bytes");
+}
+
+void testRandomBytes() {
+    redis_clone::RespLimits limits;
+    limits.maxBulkLength = 1024;
+    limits.maxArrayLength = 128;
+    limits.maxCommandBytes = 1024;
+    limits.maxNestingDepth = 16;
+    RespParser parser(limits);
+    std::mt19937 random(0xF022);
+
+    for (int sample = 0; sample < 10000; ++sample) {
+        const std::size_t size = random() % 256;
+        std::string bytes(size, '\0');
+        for (char& byte : bytes) {
+            byte = static_cast<char>(random() & 0xFF);
+        }
+
+        Buffer buffer;
+        buffer.append(bytes);
+        for (int parseCount = 0; parseCount < 8 && !buffer.empty(); ++parseCount) {
+            const auto result = parser.parse(buffer);
+            if (result.status != ParseStatus::Command) {
+                break;
+            }
+        }
+    }
 }
 
 void testWriter() {
@@ -168,6 +265,8 @@ int main() {
         testRespValueTypes();
         testInlineCommands();
         testErrorsAndLimits();
+        testBufferSelfAppend();
+        testRandomBytes();
         testWriter();
     } catch (const std::exception& error) {
         std::cerr << "RESP test failed: " << error.what() << '\n';

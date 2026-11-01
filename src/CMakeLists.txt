@@ -8,14 +8,23 @@ target_include_directories(redis-resp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(redis-resp PUBLIC cxx_std_17)
 target_compile_options(redis-resp PRIVATE -Wall -Wextra -Wpedantic)
 
+add_library(redis-net
+    command/command.cpp
+    net/event_loop.cpp
+    net/socket.cpp
+)
+target_include_directories(redis-net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_features(redis-net PUBLIC cxx_std_17)
+target_compile_options(redis-net PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(redis-net PUBLIC redis-resp)
+
 add_executable(redis-server
     main.cpp
-    net/socket.cpp
 )
 
 target_compile_features(redis-server PRIVATE cxx_std_17)
 target_compile_options(redis-server PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(redis-server PRIVATE redis-resp)
+target_link_libraries(redis-server PRIVATE redis-net)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -25,4 +34,11 @@ if(BUILD_TESTING)
     target_compile_options(resp-test PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(resp-test PRIVATE redis-resp)
     add_test(NAME resp-test COMMAND resp-test)
+
+    add_executable(event-loop-test
+        tests/event_loop_test.cpp
+    )
+    target_compile_options(event-loop-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(event-loop-test PRIVATE redis-net)
+    add_test(NAME event-loop-test COMMAND event-loop-test)
 endif()

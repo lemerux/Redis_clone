@@ -17,9 +17,14 @@ public:
 
     static Socket createTcp();
 
+    int nativeHandle() const noexcept;
+    void setNonBlocking() const;
+    void setTcpNoDelay() const;
     void bindIpv4Any(unsigned short port) const;
     void listen(int backlog) const;
     Socket accept() const;
+    ssize_t readSome(char* buffer, std::size_t capacity) const;
+    ssize_t writeSome(const char* data, std::size_t size) const;
     ssize_t read(char* buffer, std::size_t capacity) const;
     void writeAll(const char* data, std::size_t size) const;
 
