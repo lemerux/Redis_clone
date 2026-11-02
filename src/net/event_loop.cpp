@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -35,6 +36,30 @@ void epollControl(int epollFd, int operation, int fd, std::uint32_t events) {
 
 void appendCommandError(Buffer& output, std::string_view message) {
     RespWriter::writeError(output, message);
+}
+
+void logCommand(const Connection& connection, const RespValue& value) {
+    const auto* arguments = std::get_if<RespValue::Array>(&value.data);
+    const auto* name = arguments != nullptr && !arguments->empty()
+                           ? std::get_if<BulkString>(&arguments->front().data)
+                           : nullptr;
+
+    std::clog << "command client=" << connection.clientId << " name=\"";
+    if (name == nullptr) {
+        std::clog << "<malformed>";
+    } else {
+        for (const unsigned char character : name->value) {
+            if (character >= 0x20 && character <= 0x7e && character != '\\' &&
+                character != '"') {
+                std::clog << static_cast<char>(character);
+            } else {
+                std::clog << "\\x" << std::hex << std::setw(2)
+                          << std::setfill('0') << static_cast<unsigned int>(character)
+                          << std::dec << std::setfill(' ');
+            }
+        }
+    }
+    std::clog << "\"\n";
 }
 
 }  // namespace
@@ -192,6 +217,8 @@ void EventLoop::dispatchCommands(Connection& connection) {
 }
 
 void EventLoop::dispatchCommand(Connection& connection, const RespValue& value) {
+    logCommand(connection, value);
+
     const auto* arguments = std::get_if<RespValue::Array>(&value.data);
     if (arguments == nullptr || arguments->empty()) {
         appendCommandError(connection.output, "ERR invalid command format");

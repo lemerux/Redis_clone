@@ -6,6 +6,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -15,6 +16,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -26,6 +28,25 @@ void expect(bool condition, const char* message) {
         throw std::runtime_error(message);
     }
 }
+
+class ScopedLogCapture {
+public:
+    ScopedLogCapture() : previous_(std::clog.rdbuf(output_.rdbuf())) {}
+    ~ScopedLogCapture() {
+        std::clog.rdbuf(previous_);
+    }
+
+    ScopedLogCapture(const ScopedLogCapture&) = delete;
+    ScopedLogCapture& operator=(const ScopedLogCapture&) = delete;
+
+    std::string str() const {
+        return output_.str();
+    }
+
+private:
+    std::ostringstream output_;
+    std::streambuf* previous_;
+};
 
 unsigned short availablePort() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -185,11 +206,32 @@ public:
         }
     }
 
+    void close() noexcept {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    bool hasPendingResult() const {
+        pollfd descriptor{fd_, POLLIN, 0};
+        int result;
+        do {
+            result = ::poll(&descriptor, 1, 0);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) {
+            throw std::runtime_error(std::string("test client poll failed: ") +
+                                     std::strerror(errno));
+        }
+        return result > 0;
+    }
+
 private:
     int fd_ = -1;
 };
 
 void testPipeliningAndErrors(EventLoopThread& server) {
+    ScopedLogCapture log;
     Client client(server.port());
     client.send("*1\r\n$4\r\nPING\r\n"
                 "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n"
@@ -202,6 +244,13 @@ void testPipeliningAndErrors(EventLoopThread& server) {
         "-ERR wrong number of arguments for 'echo' command\r\n";
     expect(client.readExact(expected.size()) == expected,
            "pipelined commands or command errors returned unexpected replies");
+    const std::string loggedCommands = log.str();
+    expect(loggedCommands.find("name=\"PING\"") != std::string::npos &&
+               loggedCommands.find("name=\"ECHO\"") != std::string::npos &&
+               loggedCommands.find("name=\"NOTACMDxx\"") != std::string::npos,
+           "command log did not include every pipelined command name");
+    expect(loggedCommands.find("hello") == std::string::npos,
+           "command log unexpectedly included command arguments");
 }
 
 void testFragmentedCommand(EventLoopThread& server) {
@@ -245,6 +294,29 @@ void testConcurrentClients(EventLoopThread& server) {
     }
 }
 
+void testMidCommandDisconnectAndSameBatchAccept() {
+    const unsigned short port = availablePort();
+    redis_clone::EventLoop eventLoop(port);
+
+    Client incompleteCommand(port);
+    eventLoop.runOnce();
+    incompleteCommand.send("*2\r\n$4\r\nECHO\r\n$100\r\npartial");
+    eventLoop.runOnce();
+    incompleteCommand.close();
+
+    Client replacement(port);
+    replacement.send("*1\r\n$4\r\nPING\r\n");
+
+    // Both the old connection's disconnect and the new connection are ready
+    // before this wait, so their events are handled in the same epoll batch.
+    eventLoop.runOnce();
+    for (int attempt = 0; attempt < 10 && !replacement.hasPendingResult(); ++attempt) {
+        eventLoop.runOnce();
+    }
+    expect(replacement.readExact(7) == "+PONG\r\n",
+           "new connection was affected by a mid-command disconnect");
+}
+
 }  // namespace
 
 int main() {
@@ -255,6 +327,7 @@ int main() {
         testQuitAndHalfClose(server);
         testConcurrentClients(server);
         server.stop();
+        testMidCommandDisconnectAndSameBatchAccept();
     } catch (const std::exception& error) {
         std::cerr << "Event loop test failed: " << error.what() << '\n';
         return 1;
