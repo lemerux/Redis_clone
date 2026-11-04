@@ -51,6 +51,7 @@ connection state exposed to a command handler:
 - `output` is a reference to the connection's reply buffer.
 - `closeAfterReply` is a reference to the flag a handler can set to request
   connection closure after its reply is delivered (used by `QUIT`).
+- `database` references the server keyspace shared by all connections.
 
 It lets free-function handlers act on the relevant connection state without
 needing to know about the whole `EventLoop` or `Connection`.
@@ -71,8 +72,8 @@ the name is unknown.
 ### `CommandHandler`
 
 Declared in [`command.h`](../command/command.h) as a function-pointer alias.
-A handler receives its `CommandContext` and the command's RESP array. The
-current handlers are `cmd_ping`, `cmd_echo`, and `cmd_quit`.
+A handler receives its `CommandContext` and the command's RESP array. Handlers
+are split across the command, string, key, and server modules.
 
 ### `RespValue` and `RespValue::Array`
 

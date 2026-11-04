@@ -294,6 +294,64 @@ void testConcurrentClients(EventLoopThread& server) {
     }
 }
 
+void testStringAndKeyCommands(EventLoopThread& server) {
+    Client client(server.port());
+    client.send("*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$2\r\n41\r\n"
+                "*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n"
+                "*3\r\n$6\r\nINCRBY\r\n$1\r\nn\r\n$1\r\n8\r\n"
+                "*2\r\n$4\r\nDECR\r\n$1\r\nn\r\n"
+                "*2\r\n$3\r\nGET\r\n$1\r\nn\r\n"
+                "*3\r\n$6\r\nAPPEND\r\n$1\r\nn\r\n$3\r\nxyz\r\n"
+                "*2\r\n$6\r\nSTRLEN\r\n$1\r\nn\r\n");
+    const std::string stringReplies =
+        "+OK\r\n:42\r\n:50\r\n:49\r\n$2\r\n49\r\n:5\r\n:5\r\n";
+    expect(client.readExact(stringReplies.size()) == stringReplies,
+           "string commands returned unexpected replies");
+
+    client.send("*3\r\n$3\r\nSET\r\n$3\r\nmax\r\n$19\r\n"
+                "9223372036854775807\r\n"
+                "*2\r\n$4\r\nINCR\r\n$3\r\nmax\r\n"
+                "*2\r\n$3\r\nGET\r\n$3\r\nmax\r\n"
+                "*3\r\n$6\r\nINCRBY\r\n$3\r\nmax\r\n$2\r\n-1\r\n");
+    const std::string overflowReplies =
+        "+OK\r\n-ERR increment or decrement would overflow\r\n"
+        "$19\r\n9223372036854775807\r\n:9223372036854775806\r\n";
+    expect(client.readExact(overflowReplies.size()) == overflowReplies,
+           "integer overflow should fail without changing the stored value");
+
+    client.send("*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$3\r\none\r\n"
+                "$1\r\nb\r\n$3\r\ntwo\r\n"
+                "*4\r\n$4\r\nMGET\r\n$1\r\na\r\n$1\r\nb\r\n$7\r\nmissing\r\n"
+                "*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$7\r\nmissing\r\n"
+                "*3\r\n$6\r\nEXISTS\r\n$1\r\nb\r\n$1\r\nb\r\n"
+                "*2\r\n$4\r\nTYPE\r\n$1\r\nn\r\n"
+                "*1\r\n$6\r\nDBSIZE\r\n");
+    const std::string keyReplies =
+        "+OK\r\n*3\r\n$3\r\none\r\n$3\r\ntwo\r\n$-1\r\n"
+        ":1\r\n:2\r\n+string\r\n:3\r\n";
+    expect(client.readExact(keyReplies.size()) == keyReplies,
+           "multi-key and key-inspection commands returned unexpected replies");
+
+    client.send("*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n"
+                "*4\r\n$4\r\nSCAN\r\n$1\r\n0\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n");
+    const std::string enumerationReplies =
+        "*3\r\n$1\r\nn\r\n$3\r\nmax\r\n$1\r\nb\r\n"
+        "*2\r\n$1\r\n1\r\n*1\r\n$1\r\nn\r\n";
+    expect(client.readExact(enumerationReplies.size()) == enumerationReplies,
+           "KEYS or SCAN returned unexpected results");
+
+    client.send("*3\r\n$6\r\nRENAME\r\n$1\r\nn\r\n$7\r\nrenamed\r\n"
+                "*2\r\n$3\r\nGET\r\n$7\r\nrenamed\r\n"
+                "*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n"
+                "*1\r\n$8\r\nFLUSHALL\r\n"
+                "*1\r\n$6\r\nDBSIZE\r\n");
+    const std::string managementReplies =
+        "+OK\r\n$5\r\n49xyz\r\n*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n"
+        "+OK\r\n:0\r\n";
+    expect(client.readExact(managementReplies.size()) == managementReplies,
+           "rename, CONFIG, or flush commands returned unexpected replies");
+}
+
 void testMidCommandDisconnectAndSameBatchAccept() {
     const unsigned short port = availablePort();
     redis_clone::EventLoop eventLoop(port);
@@ -326,6 +384,7 @@ int main() {
         testFragmentedCommand(server);
         testQuitAndHalfClose(server);
         testConcurrentClients(server);
+        testStringAndKeyCommands(server);
         server.stop();
         testMidCommandDisconnectAndSameBatchAccept();
     } catch (const std::exception& error) {

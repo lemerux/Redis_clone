@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -25,10 +26,11 @@ constexpr int kTimerTickMilliseconds = 100;
     throw std::system_error(errno, std::generic_category(), operation);
 }
 
-void epollControl(int epollFd, int operation, int fd, std::uint32_t events) {
+void epollControl(int epollFd, int operation, int fd, std::uint32_t events,
+                  std::uint64_t eventToken) {
     epoll_event event{};
     event.events = events;
-    event.data.fd = fd;
+    event.data.u64 = eventToken;
     if (::epoll_ctl(epollFd, operation, fd, &event) < 0) {
         throwSystemError("epoll_ctl");
     }
@@ -64,8 +66,9 @@ void logCommand(const Connection& connection, const RespValue& value) {
 
 }  // namespace
 
-Connection::Connection(Socket clientSocket, std::uint64_t id)
-    : socket(std::move(clientSocket)), clientId(id) {}
+Connection::Connection(Socket clientSocket, std::uint64_t id,
+                       std::uint64_t token)
+    : socket(std::move(clientSocket)), clientId(id), eventToken(token) {}
 
 EventLoop::EventLoop(unsigned short port) : listener_(Socket::createTcp()) {
     listener_.setNonBlocking();
@@ -77,7 +80,7 @@ EventLoop::EventLoop(unsigned short port) : listener_(Socket::createTcp()) {
         throwSystemError("epoll_create1");
     }
     try {
-        epollControl(epollFd_, EPOLL_CTL_ADD, listener_.nativeHandle(), EPOLLIN);
+        epollControl(epollFd_, EPOLL_CTL_ADD, listener_.nativeHandle(), EPOLLIN, 0);
     } catch (...) {
         ::close(epollFd_);
         epollFd_ = -1;
@@ -104,11 +107,15 @@ void EventLoop::runOnce() {
     }
 
     for (int i = 0; i < eventCount; ++i) {
-        const int fd = events[static_cast<std::size_t>(i)].data.fd;
-        if (fd == listener_.nativeHandle()) {
+        const std::uint64_t token = events[static_cast<std::size_t>(i)].data.u64;
+        if (token == 0) {
             acceptClients();
         } else {
-            handleClientEvent(fd, events[static_cast<std::size_t>(i)].events);
+            const auto found = clientFds_.find(token);
+            if (found != clientFds_.end()) {
+                handleClientEvent(found->second,
+                                  events[static_cast<std::size_t>(i)].events);
+            }
         }
     }
     finishDeferredCloses();
@@ -130,13 +137,18 @@ void EventLoop::acceptClients() {
         client.setNonBlocking();
         client.setTcpNoDelay();
         const int fd = client.nativeHandle();
-        auto connection =
-            std::make_unique<Connection>(std::move(client), nextClientId_++);
+        const std::uint64_t token = nextEventToken_++;
+        if (token == 0) {
+            throw std::overflow_error("epoll event token space exhausted");
+        }
+        auto connection = std::make_unique<Connection>(
+            std::move(client), nextClientId_++, token);
         const auto index = static_cast<std::size_t>(fd);
         if (connections_.size() <= index) {
             connections_.resize(index + 1);
         }
-        epollControl(epollFd_, EPOLL_CTL_ADD, fd, EPOLLIN | EPOLLRDHUP);
+        epollControl(epollFd_, EPOLL_CTL_ADD, fd, EPOLLIN | EPOLLRDHUP, token);
+        clientFds_.emplace(token, fd);
         connections_[index] = std::move(connection);
     }
 }
@@ -252,7 +264,8 @@ void EventLoop::dispatchCommand(Connection& connection, const RespValue& value) 
         return;
     }
 
-    CommandContext context{connection.output, connection.closeAfterReply};
+    CommandContext context{connection.output, connection.closeAfterReply,
+                           database_};
     command->handler(context, *arguments);
 }
 
@@ -295,7 +308,8 @@ void EventLoop::updateInterest(Connection& connection) {
     if (!connection.output.empty()) {
         events |= EPOLLOUT;
     }
-    epollControl(epollFd_, EPOLL_CTL_MOD, connection.socket.nativeHandle(), events);
+    epollControl(epollFd_, EPOLL_CTL_MOD, connection.socket.nativeHandle(),
+                 events, connection.eventToken);
 }
 
 void EventLoop::closeConnection(Connection& connection) {
@@ -310,12 +324,17 @@ void EventLoop::closeConnection(Connection& connection) {
                   << ": " << std::system_error(errno, std::generic_category()).what()
                   << '\n';
     }
-    deferredCloses_.push_back(fd);
+    clientFds_.erase(connection.eventToken);
+    deferredCloses_.push_back({fd, connection.clientId});
 }
 
 void EventLoop::finishDeferredCloses() {
-    for (const int fd : deferredCloses_) {
-        connections_[static_cast<std::size_t>(fd)].reset();
+    for (const DeferredClose& deferred : deferredCloses_) {
+        const auto index = static_cast<std::size_t>(deferred.fd);
+        if (index < connections_.size() && connections_[index] != nullptr &&
+            connections_[index]->clientId == deferred.clientId) {
+            connections_[index].reset();
+        }
     }
     deferredCloses_.clear();
 }
