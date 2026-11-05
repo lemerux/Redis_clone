@@ -69,21 +69,6 @@ std::optional<std::string> KeyTable::sample(std::uint64_t randomValue) const {
     return keys_[static_cast<std::size_t>(randomValue % keys_.size())];
 }
 
-std::size_t KeyTable::scan(std::size_t cursor, std::size_t count,
-                           std::vector<std::string>& results) const {
-    results.clear();
-    if (cursor >= keys_.size() || count == 0) {
-        return 0;
-    }
-    const std::size_t end = cursor + (count > keys_.size() - cursor
-                                          ? keys_.size() - cursor
-                                          : count);
-    results.insert(results.end(),
-                   keys_.begin() + static_cast<std::ptrdiff_t>(cursor),
-                   keys_.begin() + static_cast<std::ptrdiff_t>(end));
-    return end == keys_.size() ? 0 : end;
-}
-
 const std::vector<std::string>& KeyTable::keys() const noexcept {
     return keys_;
 }

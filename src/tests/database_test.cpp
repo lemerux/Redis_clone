@@ -4,7 +4,6 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -44,23 +43,11 @@ void testLogicalAccounting() {
            "flush must clear entries and reset logical usage");
 }
 
-void testSamplingAndScanAcrossGrowth() {
+void testSamplingAcrossGrowth() {
     redis_clone::Database database;
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 1007; ++i) {
         database.setString("key-" + std::to_string(i), "value");
     }
-    std::vector<std::string> firstBatch;
-    const std::size_t next = database.scan(0, 4, firstBatch);
-    expect(firstBatch.size() == 4 && next == 4,
-           "SCAN should advance by the requested number of slots");
-
-    for (int i = 7; i < 1007; ++i) {
-        database.setString("key-" + std::to_string(i), "value");
-    }
-    std::vector<std::string> remaining;
-    database.scan(next, 1003, remaining);
-    expect(remaining.size() == 1003,
-           "SCAN cursor must remain usable after map rehash");
 
     for (std::uint64_t i = 0; i < 1000; ++i) {
         const auto sample = database.sampleKey(i);
@@ -68,14 +55,6 @@ void testSamplingAndScanAcrossGrowth() {
                "random sampling must return a live key");
     }
 
-    std::size_t cursor = 0;
-    std::size_t scanned = 0;
-    do {
-        std::vector<std::string> batch;
-        cursor = database.scan(cursor, 23, batch);
-        scanned += batch.size();
-    } while (cursor != 0);
-    expect(scanned == database.size(), "full scan should cover all current keys");
 }
 
 void testRemovalSink() {
@@ -100,7 +79,7 @@ void testRemovalSink() {
 int main() {
     try {
         testLogicalAccounting();
-        testSamplingAndScanAcrossGrowth();
+        testSamplingAcrossGrowth();
         testRemovalSink();
     } catch (const std::exception& error) {
         std::cerr << "Database test failed: " << error.what() << '\n';

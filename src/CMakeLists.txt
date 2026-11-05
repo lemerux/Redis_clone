@@ -9,6 +9,7 @@ target_compile_features(redis-resp PUBLIC cxx_std_17)
 target_compile_options(redis-resp PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(redis-store
+    store/expiry_index.cpp
     store/key_table.cpp
     store/database.cpp
 )
@@ -18,11 +19,13 @@ target_compile_options(redis-store PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(redis-net
     command/command.cpp
+    command/cmd_auth.cpp
     command/cmd_string.cpp
     command/cmd_keys.cpp
     command/cmd_server.cpp
     net/event_loop.cpp
     net/socket.cpp
+    user/user_registry.cpp
 )
 target_include_directories(redis-net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(redis-net PUBLIC cxx_std_17)

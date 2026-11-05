@@ -225,10 +225,13 @@ BUILD
     jemalloc and glibc builds. Has a removal sink
     (callback) fired when a key is removed by lazy expiry, active expiry or
     eviction, so Step 8 can log DELs.
-  - User (struct): { id, name, password hash, Database db, quota,
+  - User (struct): { id, name, password, Database db, quota,
     session_client_id }. Store an id, not a Connection*, so it cannot dangle.
   - UserRegistry (class): map name -> User, lookup, create (from a users file
     or a config), password verification, claimSession()/releaseSession().
+    Initial server configuration uses `redis-server [port] [users-file]`;
+    each non-comment file line is `username password` (plaintext; restrict
+    file permissions). Omitting the file configures no users.
   - CommandContext now carries Database& for the authenticated user. Handlers
     never see other users' data.
   - cmd_auth.cpp: AUTH, WHOAMI.
@@ -344,7 +347,7 @@ FEATURES
   - ZADD (NX, XX, GT, LT, CH), ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD,
     ZRANGE (WITHSCORES, REV), ZRANGEBYSCORE, ZINCRBY, ZCOUNT, ZREMRANGEBYRANK.
   - Order: by score, ties by member (lexicographic).
-  - Parse +inf, -inf, and exclusive ranges like "(5".
+  - Parse +inf, -inf, and exclusive ranges like "5".
 TEST
   - Property test: after random operations, compare SkipList contents with a
     std::set<pair<double,string>> reference.

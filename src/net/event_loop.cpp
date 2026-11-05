@@ -3,6 +3,7 @@
 #include <array>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -20,7 +21,9 @@ namespace {
 
 constexpr std::size_t kReadBufferSize = 4096;
 constexpr std::size_t kMaxEvents = 1024;
+constexpr std::size_t kMaxClientSockets = 10'000;
 constexpr int kTimerTickMilliseconds = 100;
+constexpr auto kActiveExpireBudget = std::chrono::milliseconds(1);
 
 [[noreturn]] void throwSystemError(const char* operation) {
     throw std::system_error(errno, std::generic_category(), operation);
@@ -70,7 +73,8 @@ Connection::Connection(Socket clientSocket, std::uint64_t id,
                        std::uint64_t token)
     : socket(std::move(clientSocket)), clientId(id), eventToken(token) {}
 
-EventLoop::EventLoop(unsigned short port) : listener_(Socket::createTcp()) {
+EventLoop::EventLoop(unsigned short port, UserRegistry users)
+    : listener_(Socket::createTcp()), users_(std::move(users)) {
     listener_.setNonBlocking();
     listener_.bindIpv4Any(port);
     listener_.listen(128);
@@ -119,10 +123,15 @@ void EventLoop::runOnce() {
         }
     }
     finishDeferredCloses();
+    users_.activeExpireCycle(kActiveExpireBudget);
 }
 
 void EventLoop::acceptClients() {
     while (true) {
+        if (activeClientCount_ >= kMaxClientSockets) {
+            return;
+        }
+
         Socket client;
         try {
             client = listener_.accept();
@@ -150,6 +159,8 @@ void EventLoop::acceptClients() {
         epollControl(epollFd_, EPOLL_CTL_ADD, fd, EPOLLIN | EPOLLRDHUP, token);
         clientFds_.emplace(token, fd);
         connections_[index] = std::move(connection);
+        ++activeClientCount_;
+        updateListenerInterest();
     }
 }
 
@@ -245,6 +256,13 @@ void EventLoop::dispatchCommand(Connection& connection, const RespValue& value) 
     }
 
     const auto& name = std::get<BulkString>(arguments->front().data).value;
+    if (connection.authenticatedUser == nullptr &&
+        !asciiCaseEqual(name, "AUTH") && !asciiCaseEqual(name, "PING") &&
+        !asciiCaseEqual(name, "QUIT")) {
+        appendCommandError(connection.output, "NOAUTH Authentication required.");
+        return;
+    }
+
     const CommandSpec* command = commandTable_.find(name);
     if (command == nullptr) {
         appendCommandError(connection.output, "ERR unknown command");
@@ -264,8 +282,12 @@ void EventLoop::dispatchCommand(Connection& connection, const RespValue& value) 
         return;
     }
 
+    Database& database = connection.authenticatedUser == nullptr
+                             ? unauthenticatedDatabase_
+                             : connection.authenticatedUser->database;
     CommandContext context{connection.output, connection.closeAfterReply,
-                           database_};
+                           database, users_, connection.authenticatedUser,
+                           connection.clientId};
     command->handler(context, *arguments);
 }
 
@@ -312,11 +334,26 @@ void EventLoop::updateInterest(Connection& connection) {
                  events, connection.eventToken);
 }
 
+void EventLoop::updateListenerInterest() {
+    const bool shouldAccept = activeClientCount_ < kMaxClientSockets;
+    if (shouldAccept == listenerAccepting_) {
+        return;
+    }
+
+    epollControl(epollFd_, EPOLL_CTL_MOD, listener_.nativeHandle(),
+                 shouldAccept ? static_cast<std::uint32_t>(EPOLLIN) : 0U, 0);
+    listenerAccepting_ = shouldAccept;
+}
+
 void EventLoop::closeConnection(Connection& connection) {
     if (connection.closing) {
         return;
     }
     connection.closing = true;
+    if (connection.authenticatedUser != nullptr) {
+        users_.releaseSession(*connection.authenticatedUser, connection.clientId);
+        connection.authenticatedUser = nullptr;
+    }
     const int fd = connection.socket.nativeHandle();
     if (::epoll_ctl(epollFd_, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
         errno != ENOENT && errno != EBADF) {
@@ -334,9 +371,11 @@ void EventLoop::finishDeferredCloses() {
         if (index < connections_.size() && connections_[index] != nullptr &&
             connections_[index]->clientId == deferred.clientId) {
             connections_[index].reset();
+            --activeClientCount_;
         }
     }
     deferredCloses_.clear();
+    updateListenerInterest();
 }
 
 }  // namespace redis_clone

@@ -3,6 +3,7 @@
 #include "command/command.h"
 #include "net/socket.h"
 #include "resp/resp.h"
+#include "user/user_registry.h"
 
 #include <cstdint>
 #include <memory>
@@ -20,13 +21,14 @@ struct Connection {
     Buffer output;
     std::uint64_t clientId;
     std::uint64_t eventToken;
+    User* authenticatedUser = nullptr;
     bool closeAfterReply = false;
     bool closing = false;
 };
 
 class EventLoop {
 public:
-    explicit EventLoop(unsigned short port);
+    explicit EventLoop(unsigned short port, UserRegistry users = {});
     ~EventLoop();
 
     EventLoop(const EventLoop&) = delete;
@@ -47,6 +49,7 @@ private:
     void dispatchCommand(Connection& connection, const RespValue& value);
     void writeToClient(Connection& connection);
     void updateInterest(Connection& connection);
+    void updateListenerInterest();
     void closeConnection(Connection& connection);
     void finishDeferredCloses();
 
@@ -54,10 +57,13 @@ private:
     Socket listener_;
     RespParser parser_;
     CommandTable commandTable_;
-    Database database_;
+    Database unauthenticatedDatabase_;
+    UserRegistry users_;
     std::vector<std::unique_ptr<Connection>> connections_;
     std::vector<DeferredClose> deferredCloses_;
     std::unordered_map<std::uint64_t, int> clientFds_;
+    std::size_t activeClientCount_ = 0;
+    bool listenerAccepting_ = true;
     std::uint64_t nextClientId_ = 1;
     std::uint64_t nextEventToken_ = 1;
 };

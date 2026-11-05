@@ -21,8 +21,6 @@ public:
     void clear() noexcept;
     std::size_t size() const noexcept;
     std::optional<std::string> sample(std::uint64_t randomValue) const;
-    std::size_t scan(std::size_t cursor, std::size_t count,
-                     std::vector<std::string>& results) const;
     const std::vector<std::string>& keys() const noexcept;
 
 private:

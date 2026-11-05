@@ -1,8 +1,12 @@
 #include "command/command.h"
 
+#include "store/clock.h"
+
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -58,7 +62,7 @@ void increment(CommandContext& context, const std::string& key,
     }
     number += amount;
     const std::string updated = std::to_string(number);
-    context.database.setString(key, updated);
+    context.database.setString(key, updated, true);
     RespWriter::writeInt(context.output, number);
 }
 
@@ -67,13 +71,58 @@ void increment(CommandContext& context, const std::string& key,
 void cmd_set(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
     const std::string& value = stringArgument(arguments, 2);
-    if (arguments.size() != 3) {
-        RespWriter::writeError(
-            context.output,
-            "ERR syntax error (SET options are not supported in this step)");
+    bool keepTtl = false;
+    std::optional<std::int64_t> deadline;
+    for (std::size_t i = 3; i < arguments.size(); ++i) {
+        const std::string& option = stringArgument(arguments, i);
+        if (asciiCaseEqual(option, "KEEPTTL")) {
+            if (keepTtl || deadline.has_value()) {
+                RespWriter::writeError(context.output, "ERR syntax error");
+                return;
+            }
+            keepTtl = true;
+            continue;
+        }
+        if (!asciiCaseEqual(option, "EX") && !asciiCaseEqual(option, "PX")) {
+            RespWriter::writeError(context.output, "ERR syntax error");
+            return;
+        }
+        if (deadline.has_value() || i + 1 >= arguments.size()) {
+            RespWriter::writeError(context.output, "ERR syntax error");
+            return;
+        }
+
+        std::int64_t amount = 0;
+        if (!parseInteger(stringArgument(arguments, ++i), amount) ||
+            amount <= 0) {
+            RespWriter::writeError(context.output,
+                                   "ERR invalid expire time in 'set' command");
+            return;
+        }
+        const std::int64_t multiplier =
+            asciiCaseEqual(option, "EX") ? 1000 : 1;
+        if (amount > std::numeric_limits<std::int64_t>::max() / multiplier) {
+            RespWriter::writeError(context.output,
+                                   "ERR invalid expire time in 'set' command");
+            return;
+        }
+        const std::int64_t delta = amount * multiplier;
+        const std::int64_t currentTime = nowMs();
+        if (currentTime > std::numeric_limits<std::int64_t>::max() - delta) {
+            RespWriter::writeError(context.output,
+                                   "ERR invalid expire time in 'set' command");
+            return;
+        }
+        deadline = currentTime + delta;
+    }
+    if (keepTtl && deadline.has_value()) {
+        RespWriter::writeError(context.output, "ERR syntax error");
         return;
     }
-    context.database.setString(key, value);
+    context.database.setString(key, value, keepTtl);
+    if (deadline.has_value()) {
+        context.database.setExpireAt(key, *deadline);
+    }
     RespWriter::writeOk(context.output);
 }
 
@@ -127,7 +176,7 @@ void cmd_append(CommandContext& context, const RespValue::Array& arguments) {
         return;
     }
     const auto length = static_cast<std::int64_t>(value.size());
-    context.database.setString(key, std::move(value));
+    context.database.setString(key, std::move(value), true);
     RespWriter::writeInt(context.output, length);
 }
 

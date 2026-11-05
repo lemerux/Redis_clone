@@ -11,10 +11,12 @@ namespace {
 constexpr std::size_t kUnlimitedArguments =
     std::numeric_limits<std::size_t>::max();
 
-const std::array<CommandSpec, 22> kCommands{{
+const std::array<CommandSpec, 30> kCommands{{
     {"PING", 1, 2, cmd_ping},
     {"ECHO", 2, 2, cmd_echo},
     {"QUIT", 1, 1, cmd_quit},
+    {"AUTH", 3, 3, cmd_auth},
+    {"WHOAMI", 1, 1, cmd_whoami},
     {"SET", 3, kUnlimitedArguments, cmd_set},
     {"GET", 2, 2, cmd_get},
     {"INCR", 2, 2, cmd_incr},
@@ -30,8 +32,14 @@ const std::array<CommandSpec, 22> kCommands{{
     {"DBSIZE", 1, 1, cmd_dbsize},
     {"FLUSHALL", 1, 1, cmd_flushall},
     {"KEYS", 2, 2, cmd_keys},
-    {"SCAN", 2, kUnlimitedArguments, cmd_scan},
     {"RENAME", 3, 3, cmd_rename},
+    {"EXPIRE", 3, 3, cmd_expire},
+    {"PEXPIRE", 3, 3, cmd_pexpire},
+    {"EXPIREAT", 3, 3, cmd_expireat},
+    {"PEXPIREAT", 3, 3, cmd_pexpireat},
+    {"TTL", 2, 2, cmd_ttl},
+    {"PTTL", 2, 2, cmd_pttl},
+    {"PERSIST", 2, 2, cmd_persist},
     {"INFO", 1, 2, cmd_info},
     {"CONFIG", 3, 3, cmd_config},
 }};

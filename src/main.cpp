@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <system_error>
+#include <utility>
 
 namespace {
 
@@ -15,22 +17,32 @@ void handleSignal(int) {
     stopping = 1;
 }
 
-unsigned short parsePort(int argc, char* argv[]) {
-    if (argc > 2) {
-        throw std::invalid_argument("usage: redis-server [port]");
-    }
-    if (argc == 1) {
-        return 6379;
-    }
+struct ServerArguments {
+    unsigned short port;
+    std::string usersFile;
+};
 
-    char* end = nullptr;
-    errno = 0;
-    const long port = std::strtol(argv[1], &end, 10);
-    if (errno != 0 || end == argv[1] || *end != '\0' || port < 1 ||
-        port > std::numeric_limits<unsigned short>::max()) {
-        throw std::invalid_argument("port must be an integer from 1 to 65535");
+ServerArguments parseArguments(int argc, char* argv[]) {
+    if (argc > 3) {
+        throw std::invalid_argument(
+            "usage: redis-server [port] [users-file]");
     }
-    return static_cast<unsigned short>(port);
+    ServerArguments result{6379, {}};
+    if (argc >= 2) {
+        char* end = nullptr;
+        errno = 0;
+        const long port = std::strtol(argv[1], &end, 10);
+        if (errno != 0 || end == argv[1] || *end != '\0' || port < 1 ||
+            port > std::numeric_limits<unsigned short>::max()) {
+            throw std::invalid_argument(
+                "port must be an integer from 1 to 65535");
+        }
+        result.port = static_cast<unsigned short>(port);
+    }
+    if (argc == 3) {
+        result.usersFile = argv[2];
+    }
+    return result;
 }
 
 }  // namespace
@@ -45,9 +57,13 @@ int main(int argc, char* argv[]) {
             throw std::system_error(errno, std::generic_category(), "sigaction");
         }
 
-        const unsigned short port = parsePort(argc, argv);
-        redis_clone::EventLoop eventLoop(port);
-        std::cout << "Listening on port " << port << std::endl;
+        const ServerArguments arguments = parseArguments(argc, argv);
+        redis_clone::UserRegistry users;
+        if (!arguments.usersFile.empty()) {
+            users = redis_clone::UserRegistry::loadFromFile(arguments.usersFile);
+        }
+        redis_clone::EventLoop eventLoop(arguments.port, std::move(users));
+        std::cout << "Listening on port " << arguments.port << std::endl;
 
         while (!stopping) {
             eventLoop.runOnce();

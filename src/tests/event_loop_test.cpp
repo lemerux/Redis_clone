@@ -1,10 +1,14 @@
 #include "net/event_loop.h"
+#include "user/user_registry.h"
 
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -76,9 +80,55 @@ unsigned short availablePort() {
     return ntohs(address.sin_port);
 }
 
+redis_clone::UserRegistry makeTestUsers() {
+    redis_clone::UserRegistry users;
+    users.addUser("pipeline", "pipeline-pass");
+    users.addUser("strings", "strings-pass");
+    users.addUser("alpha", "alpha-pass");
+    users.addUser("beta", "beta-pass");
+    return users;
+}
+
+void testUsersFileLoading() {
+    char pathTemplate[] = "/tmp/redis-clone-users-test-XXXXXX";
+    const int fd = ::mkstemp(pathTemplate);
+    if (fd < 0) {
+        throw std::runtime_error("could not create users-file test fixture");
+    }
+    ::close(fd);
+    const std::string path(pathTemplate);
+    try {
+        {
+            std::ofstream usersFile(path);
+            if (!usersFile) {
+                throw std::runtime_error(
+                    "could not create users-file test fixture");
+            }
+            usersFile << "# test accounts\nfile-user file-password\n";
+            if (!usersFile) {
+                throw std::runtime_error(
+                    "could not write users-file test fixture");
+            }
+        }
+        const redis_clone::UserRegistry users =
+            redis_clone::UserRegistry::loadFromFile(path);
+        const redis_clone::User* user = users.find("file-user");
+        expect(user != nullptr &&
+                   users.verifyPassword(*user, "file-password"),
+               "users file did not configure the expected account");
+    } catch (...) {
+        std::remove(path.c_str());
+        throw;
+    }
+    if (std::remove(path.c_str()) != 0) {
+        throw std::runtime_error("could not remove users-file test fixture");
+    }
+}
+
 class EventLoopThread {
 public:
-    EventLoopThread() : port_(availablePort()), eventLoop_(port_) {
+    EventLoopThread()
+        : port_(availablePort()), eventLoop_(port_, makeTestUsers()) {
         thread_ = std::thread([this] {
             try {
                 while (running_) {
@@ -181,6 +231,20 @@ public:
         }
     }
 
+    void authenticate(std::string_view username, std::string_view password) {
+        std::string command = "*3\r\n$4\r\nAUTH\r\n$";
+        command.append(std::to_string(username.size()));
+        command.append("\r\n");
+        command.append(username);
+        command.append("\r\n$");
+        command.append(std::to_string(password.size()));
+        command.append("\r\n");
+        command.append(password);
+        command.append("\r\n");
+        send(command);
+        expect(readExact(5) == "+OK\r\n", "AUTH failed for configured test user");
+    }
+
     std::string readExact(std::size_t length) {
         std::string result(length, '\0');
         std::size_t offset = 0;
@@ -233,6 +297,7 @@ private:
 void testPipeliningAndErrors(EventLoopThread& server) {
     ScopedLogCapture log;
     Client client(server.port());
+    client.authenticate("pipeline", "pipeline-pass");
     client.send("*1\r\n$4\r\nPING\r\n"
                 "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n"
                 "*1\r\n$9\r\nNOTACMDxx\r\n"
@@ -251,6 +316,8 @@ void testPipeliningAndErrors(EventLoopThread& server) {
            "command log did not include every pipelined command name");
     expect(loggedCommands.find("hello") == std::string::npos,
            "command log unexpectedly included command arguments");
+    expect(loggedCommands.find("pipeline-pass") == std::string::npos,
+           "command log unexpectedly included an AUTH password");
 }
 
 void testFragmentedCommand(EventLoopThread& server) {
@@ -296,6 +363,7 @@ void testConcurrentClients(EventLoopThread& server) {
 
 void testStringAndKeyCommands(EventLoopThread& server) {
     Client client(server.port());
+    client.authenticate("strings", "strings-pass");
     client.send("*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$2\r\n41\r\n"
                 "*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n"
                 "*3\r\n$6\r\nINCRBY\r\n$1\r\nn\r\n$1\r\n8\r\n"
@@ -333,12 +401,12 @@ void testStringAndKeyCommands(EventLoopThread& server) {
            "multi-key and key-inspection commands returned unexpected replies");
 
     client.send("*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n"
-                "*4\r\n$4\r\nSCAN\r\n$1\r\n0\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n");
+                "*1\r\n$4\r\nSCAN\r\n");
     const std::string enumerationReplies =
         "*3\r\n$1\r\nn\r\n$3\r\nmax\r\n$1\r\nb\r\n"
-        "*2\r\n$1\r\n1\r\n*1\r\n$1\r\nn\r\n";
+        "-ERR unknown command\r\n";
     expect(client.readExact(enumerationReplies.size()) == enumerationReplies,
-           "KEYS or SCAN returned unexpected results");
+           "KEYS returned unexpected results or removed SCAN is still registered");
 
     client.send("*3\r\n$6\r\nRENAME\r\n$1\r\nn\r\n$7\r\nrenamed\r\n"
                 "*2\r\n$3\r\nGET\r\n$7\r\nrenamed\r\n"
@@ -350,6 +418,79 @@ void testStringAndKeyCommands(EventLoopThread& server) {
         "+OK\r\n:0\r\n";
     expect(client.readExact(managementReplies.size()) == managementReplies,
            "rename, CONFIG, or flush commands returned unexpected replies");
+}
+
+void testAuthAndUserIsolation(EventLoopThread& server) {
+    const std::string noAuthReply = "-NOAUTH Authentication required.\r\n";
+    Client unauthenticated(server.port());
+    unauthenticated.send("*2\r\n$3\r\nGET\r\n$7\r\nbalance\r\n");
+    expect(unauthenticated.readExact(noAuthReply.size()) == noAuthReply,
+           "unauthenticated data command was not rejected");
+
+    Client invalidCredentials(server.port());
+    invalidCredentials.send(
+        "*3\r\n$4\r\nAUTH\r\n$5\r\nalpha\r\n$9\r\nwrongpass\r\n");
+    const std::string wrongPasswordReply =
+        "-WRONGPASS invalid username-password pair or user is disabled\r\n";
+    expect(invalidCredentials.readExact(wrongPasswordReply.size()) ==
+               wrongPasswordReply,
+           "invalid credentials were accepted");
+
+    Client alpha(server.port());
+    alpha.authenticate("alpha", "alpha-pass");
+    alpha.send("*1\r\n$6\r\nWHOAMI\r\n");
+    expect(alpha.readExact(11) == "$5\r\nalpha\r\n",
+           "WHOAMI did not return the authenticated username");
+    alpha.send("*3\r\n$4\r\nAUTH\r\n$4\r\nbeta\r\n$9\r\nbeta-pass\r\n"
+               "*3\r\n$3\r\nSET\r\n$7\r\nbalance\r\n$2\r\n10\r\n"
+               "*3\r\n$3\r\nSET\r\n$10\r\npersistent\r\n$2\r\n42\r\n");
+    const std::string alphaReplies =
+        "-ERR already authenticated on this connection\r\n+OK\r\n+OK\r\n";
+    expect(alpha.readExact(alphaReplies.size()) == alphaReplies,
+           "a second AUTH switched the authenticated user");
+
+    Client duplicateAlpha(server.port());
+    duplicateAlpha.send("*3\r\n$4\r\nAUTH\r\n$5\r\nalpha\r\n$10\r\nalpha-pass\r\n");
+    const std::string busyReply =
+        "-ERR user already has an active session\r\n";
+    expect(duplicateAlpha.readExact(busyReply.size()) == busyReply,
+           "a second live session for a user was not refused");
+    duplicateAlpha.send("*2\r\n$3\r\nGET\r\n$7\r\nbalance\r\n");
+    expect(duplicateAlpha.readExact(noAuthReply.size()) == noAuthReply,
+           "failed AUTH unexpectedly authenticated the connection");
+
+    Client beta(server.port());
+    beta.authenticate("beta", "beta-pass");
+    beta.send("*3\r\n$3\r\nSET\r\n$7\r\nbalance\r\n$2\r\n20\r\n"
+              "*2\r\n$3\r\nGET\r\n$7\r\nbalance\r\n");
+    expect(beta.readExact(13) == "+OK\r\n$2\r\n20\r\n",
+           "user beta did not access its own database");
+
+    alpha.send("*2\r\n$3\r\nGET\r\n$7\r\nbalance\r\n");
+    expect(alpha.readExact(8) == "$2\r\n10\r\n",
+           "user alpha did not access its own database");
+    alpha.send("*2\r\n$3\r\nDEL\r\n$7\r\nbalance\r\n"
+               "*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n"
+               "*1\r\n$6\r\nDBSIZE\r\n"
+               "*1\r\n$8\r\nFLUSHALL\r\n"
+               "*2\r\n$3\r\nGET\r\n$10\r\npersistent\r\n"
+               "*3\r\n$3\r\nSET\r\n$10\r\npersistent\r\n$2\r\n42\r\n");
+    const std::string alphaIsolationReplies =
+        ":1\r\n*1\r\n$10\r\npersistent\r\n:1\r\n+OK\r\n$-1\r\n+OK\r\n";
+    expect(alpha.readExact(alphaIsolationReplies.size()) ==
+               alphaIsolationReplies,
+           "keyspace management commands did not remain user-scoped");
+    beta.send("*2\r\n$3\r\nGET\r\n$7\r\nbalance\r\n");
+    expect(beta.readExact(8) == "$2\r\n20\r\n",
+           "alpha's DEL or FLUSHALL affected beta's database");
+
+    alpha.send("*1\r\n$4\r\nQUIT\r\n");
+    expect(alpha.readExact(5) == "+OK\r\n", "QUIT did not release alpha's session");
+    Client reconnectedAlpha(server.port());
+    reconnectedAlpha.authenticate("alpha", "alpha-pass");
+    reconnectedAlpha.send("*2\r\n$3\r\nGET\r\n$10\r\npersistent\r\n");
+    expect(reconnectedAlpha.readExact(8) == "$2\r\n42\r\n",
+           "user database was not retained across authenticated connections");
 }
 
 void testMidCommandDisconnectAndSameBatchAccept() {
@@ -379,12 +520,14 @@ void testMidCommandDisconnectAndSameBatchAccept() {
 
 int main() {
     try {
+        testUsersFileLoading();
         EventLoopThread server;
         testPipeliningAndErrors(server);
         testFragmentedCommand(server);
         testQuitAndHalfClose(server);
         testConcurrentClients(server);
         testStringAndKeyCommands(server);
+        testAuthAndUserIsolation(server);
         server.stop();
         testMidCommandDisconnectAndSameBatchAccept();
     } catch (const std::exception& error) {

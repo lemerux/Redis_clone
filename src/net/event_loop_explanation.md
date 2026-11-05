@@ -22,6 +22,8 @@ The main flow for one client request is:
    bytes remain to be sent.
 7. Connections scheduled for closure are destroyed after the current event
    batch has been processed.
+8. Each event-loop wake-up runs a bounded active-expiry cycle across configured
+   users after the event batch.
 
 ## Structs and types used
 
@@ -36,6 +38,7 @@ accepted client connection.
 | `input` | Accumulates bytes read from the client until complete RESP values can be parsed. |
 | `output` | Holds reply bytes that have not yet been fully sent. |
 | `clientId` | Monotonically assigned identifier used in command log entries. |
+| `authenticatedUser` | The configured user bound to this connection, or null until AUTH succeeds. |
 | `closeAfterReply` | Stops further command reads and closes after queued output is sent. Also set when the peer reaches EOF. |
 | `closing` | Marks a connection scheduled for deferred removal, preventing duplicate close requests or handling more events for it. |
 
@@ -51,10 +54,20 @@ connection state exposed to a command handler:
 - `output` is a reference to the connection's reply buffer.
 - `closeAfterReply` is a reference to the flag a handler can set to request
   connection closure after its reply is delivered (used by `QUIT`).
-- `database` references the server keyspace shared by all connections.
+- `database` references the authenticated user's private keyspace. Before
+  authentication, only `AUTH`, `PING`, and `QUIT` are dispatched; other
+  commands return `NOAUTH`.
+- `users`, `authenticatedUser`, and `clientId` let `AUTH` authenticate and
+  claim the user's single active session. Closing the connection releases it.
 
 It lets free-function handlers act on the relevant connection state without
 needing to know about the whole `EventLoop` or `Connection`.
+
+The server accepts an optional users file as its second argument after the
+port. Each non-comment line contains one username and password separated by
+whitespace. Passwords are stored as plaintext in this initial lightweight
+implementation, so the file should only be readable by the server owner. With
+no users file, there are no accounts to authenticate as.
 
 ### `CommandSpec`
 
@@ -143,6 +156,13 @@ handled by subsequent reads.
 
 Maximum number of readiness events returned by one `epoll_wait`: 1024.
 
+### `kMaxClientSockets`
+
+Maximum number of accepted client sockets kept open at once: 10,000. At the
+limit, the listener is temporarily removed from `epoll` so additional sockets
+remain in the kernel's pending-connection queue rather than being accepted.
+The listener is re-enabled after deferred cleanup closes a client socket.
+
 ### `kTimerTickMilliseconds`
 
 The maximum time one `epoll_wait` blocks: 100 ms. This provides a periodic
@@ -224,7 +244,11 @@ each accepted socket it:
 1. Enables non-blocking mode and TCP_NODELAY.
 2. Assigns a new client ID and creates a `Connection`.
 3. Grows the fd-indexed connection vector if necessary.
-4. Registers the socket for readable data and peer half-close notifications.
+4. Registers the socket fo    do {
+        bytesRead = ::recv(fd_, buffer, capacity, 0);
+    } while (bytesRead < 0 && errno == EINTR);
+
+  r readable data and peer half-close notifications.
 5. Stores the owning connection in the fd's vector slot.
 
 Other accept errors propagate. Socket setup and registration errors also
