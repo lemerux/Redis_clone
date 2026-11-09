@@ -1,0 +1,2 @@
+/usr/bin/ar qc libredis-resp.a "CMakeFiles/redis-resp.dir/resp/resp.cpp.o"
+/usr/bin/ranlib libredis-resp.a

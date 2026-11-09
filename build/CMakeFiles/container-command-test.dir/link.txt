@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/container-command-test.dir/link.d "CMakeFiles/container-command-test.dir/tests/container_command_test.cpp.o" -o container-command-test  libredis-net.a libredis-resp.a libredis-store.a -ldl

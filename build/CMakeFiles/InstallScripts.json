@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/lemerux/Documents/GitHub/Redis_clone/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

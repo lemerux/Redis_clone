@@ -1,0 +1,2 @@
+/usr/bin/ar qc libredis-store.a "CMakeFiles/redis-store.dir/store/expiry_index.cpp.o" "CMakeFiles/redis-store.dir/store/key_table.cpp.o" "CMakeFiles/redis-store.dir/store/database.cpp.o" "CMakeFiles/redis-store.dir/store/skip_list.cpp.o"
+/usr/bin/ranlib libredis-store.a

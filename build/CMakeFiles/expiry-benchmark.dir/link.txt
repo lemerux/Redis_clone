@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/expiry-benchmark.dir/link.d "CMakeFiles/expiry-benchmark.dir/benchmarks/expiry_benchmark.cpp.o" -o expiry-benchmark  libredis-net.a libredis-resp.a libredis-store.a -ldl

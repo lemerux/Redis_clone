@@ -1,4 +1,5 @@
 #include "command/command.h"
+#include "alloc/alloc_stats.h"
 
 #include <string>
 #include <string_view>
@@ -18,12 +19,18 @@ void cmd_echo(CommandContext& context, const RespValue::Array& arguments) {
 }
 
 void cmd_info(CommandContext& context, const RespValue::Array&) {
+    const AllocatorStats allocator = readAllocatorStats();
     std::string info =
         "# Server\r\nredis_version:0.1.0\r\n"
         "# Keyspace\r\nkeys:" +
         std::to_string(context.database.size()) + "\r\n"
         "# Memory\r\nused_bytes:" +
-        std::to_string(context.database.usedBytes()) + "\r\n";
+        std::to_string(context.database.usedBytes()) + "\r\n"
+        "allocator:" +
+        std::string(allocator.name) + "\r\nallocator_allocated_bytes:" +
+        std::to_string(allocator.allocatedBytes) +
+        "\r\nallocator_resident_bytes:" +
+        std::to_string(allocator.residentBytes) + "\r\n";
     RespWriter::writeBulk(context.output, info);
 }
 

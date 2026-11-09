@@ -224,15 +224,14 @@ DATA TYPES  (all classes, because each protects internal invariants)
 String        std::string. Optional integer encoding for fast INCR.
 Hash          Wraps unordered_map<string,string>. Later: small-array encoding
               for tiny hashes (like Redis listpack).
-List          Wraps std::deque<string> first. Later: quicklist (linked list
-              of small arrays) as an optimization.
+List          Ring buffer of strings, growing geometrically as needed.
 Set           Wraps unordered_set<string>. SINTER/SUNION/SDIFF as methods or
               free functions.
-SkipList      Private struct Node { score, member, forward levels[], span[] }.
-              Exposes insert, erase, rank, range-by-rank, range-by-score.
-              Never exposes nodes.
-ZSet          Owns a SkipList AND an unordered_map<string,double>. Keeps them
-              in sync. This sync is the main invariant of the project.
+SkipList      Node { score, member, forward levels[], span[] }. Exposes insert,
+              erase, rank, range-by-rank, range-by-score.
+ZSet          Owns a SkipList AND an unordered_map<string_view, Node*>. Each
+              map key views the member string owned by its node; scores live
+              only in nodes. The index must be rebuilt when copying a ZSet.
 
 TRANSACTIONS
 ------------

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/event-loop-test.dir/link.d "CMakeFiles/event-loop-test.dir/tests/event_loop_test.cpp.o" -o event-loop-test  libredis-net.a libredis-resp.a libredis-store.a -ldl

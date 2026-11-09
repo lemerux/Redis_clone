@@ -101,6 +101,18 @@ void cmd_type(CommandContext& context, const RespValue::Array& arguments) {
         case ObjType::String:
             context.output.append("+string\r\n");
             return;
+        case ObjType::Hash:
+            context.output.append("+hash\r\n");
+            return;
+        case ObjType::List:
+            context.output.append("+list\r\n");
+            return;
+        case ObjType::Set:
+            context.output.append("+set\r\n");
+            return;
+        case ObjType::ZSet:
+            context.output.append("+zset\r\n");
+            return;
     }
     context.output.append("+none\r\n");
 }

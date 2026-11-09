@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/database-test.dir/link.d "CMakeFiles/database-test.dir/tests/database_test.cpp.o" -o database-test  libredis-store.a

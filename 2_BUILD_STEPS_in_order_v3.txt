@@ -294,14 +294,16 @@ FEATURES
 TEST
   - Key with PX 100 is gone after 150 ms, even if never accessed again
     (verifies the active cycle).
-  - Insert 1M keys with short TTL, measure the longest event-loop stall while
-    they expire. It must stay under your budget.
-  - Also measure the stall of DEL on one huge container (for example a set of
-    1M members). The active-expiry budget does not cover freeing big values;
-    note the result and consider incremental/lazy freeing.
-  - Run both stall measurements (1M expiring keys, DEL of a 1M-member set) on
-    release-jemalloc AND release-glibc, and record the max stall and the RSS
-    after the free for each. Big frees are an allocator workload.
+  - Run `src/benchmarks/run_expiry_benchmark.sh > expiry-benchmark.csv` to
+    measure one million expiring keys under release-glibc and release-jemalloc.
+    The CSV records max active-expiry callback duration, population/expiry
+    time, and RSS before and after freeing expired keys. The callback is the
+    bounded expiry work called by the event loop; its measurement excludes
+    epoll wait time. Compare max_cycle_us with budget_us and record both rows
+    in the README. The harness accepts `--keys`, `--ttl-ms`, and `--budget-us`
+    overrides for smaller smoke runs.
+  - DEL of a 1M-member set is not included because set values are not
+    implemented yet; add that allocator benchmark with Step 6 set support.
 DONE WHEN
   - Expiry is correct (lazy and active) and the max stall is measured and
     recorded for the README.

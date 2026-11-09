@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/redis-server.dir/link.d "CMakeFiles/redis-server.dir/main.cpp.o" -o redis-server  libredis-net.a libredis-resp.a libredis-store.a -ldl

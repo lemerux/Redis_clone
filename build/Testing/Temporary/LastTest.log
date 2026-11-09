@@ -1,0 +1,194 @@
+Start testing: Nov 10 00:46 IST
+----------------------------------------------------------
+1/5 Testing: resp-test
+1/5 Test: resp-test
+Command: "/home/lemerux/Documents/GitHub/Redis_clone/build/resp-test"
+Directory: /home/lemerux/Documents/GitHub/Redis_clone/build
+"resp-test" start time: Nov 10 00:46 IST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"resp-test" end time: Nov 10 00:46 IST
+"resp-test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/5 Testing: event-loop-test
+2/5 Test: event-loop-test
+Command: "/home/lemerux/Documents/GitHub/Redis_clone/build/event-loop-test"
+Directory: /home/lemerux/Documents/GitHub/Redis_clone/build
+"event-loop-test" start time: Nov 10 00:46 IST
+Output:
+----------------------------------------------------------
+command client=2 name="PING"
+command client=3 name="QUIT"
+command client=4 name="PING"
+command client=5 name="PING"
+command client=6 name="PING"
+command client=7 name="PING"
+command client=8 name="PING"
+command client=9 name="PING"
+command client=10 name="PING"
+command client=11 name="PING"
+command client=12 name="PING"
+command client=13 name="PING"
+command client=14 name="PING"
+command client=15 name="PING"
+command client=16 name="PING"
+command client=17 name="PING"
+command client=18 name="PING"
+command client=19 name="PING"
+command client=20 name="PING"
+command client=21 name="PING"
+command client=22 name="PING"
+command client=23 name="PING"
+command client=24 name="PING"
+command client=25 name="PING"
+command client=26 name="PING"
+command client=27 name="PING"
+command client=28 name="PING"
+command client=29 name="PING"
+command client=30 name="PING"
+command client=31 name="PING"
+command client=32 name="PING"
+command client=33 name="PING"
+command client=34 name="PING"
+command client=35 name="PING"
+command client=36 name="PING"
+command client=37 name="PING"
+command client=38 name="PING"
+command client=39 name="PING"
+command client=40 name="PING"
+command client=41 name="PING"
+command client=42 name="PING"
+command client=43 name="PING"
+command client=44 name="PING"
+command client=45 name="PING"
+command client=46 name="PING"
+command client=47 name="PING"
+command client=48 name="PING"
+command client=49 name="PING"
+command client=50 name="PING"
+command client=51 name="PING"
+command client=52 name="PING"
+command client=53 name="PING"
+command client=54 name="PING"
+command client=55 name="PING"
+command client=56 name="PING"
+command client=57 name="PING"
+command client=58 name="PING"
+command client=59 name="PING"
+command client=60 name="PING"
+command client=61 name="PING"
+command client=62 name="PING"
+command client=63 name="PING"
+command client=64 name="PING"
+command client=65 name="PING"
+command client=66 name="PING"
+command client=67 name="PING"
+command client=68 name="PING"
+command client=69 name="AUTH"
+command client=69 name="SET"
+command client=69 name="INCR"
+command client=69 name="INCRBY"
+command client=69 name="DECR"
+command client=69 name="GET"
+command client=69 name="APPEND"
+command client=69 name="STRLEN"
+command client=69 name="SET"
+command client=69 name="INCR"
+command client=69 name="GET"
+command client=69 name="INCRBY"
+command client=69 name="MSET"
+command client=69 name="MGET"
+command client=69 name="DEL"
+command client=69 name="EXISTS"
+command client=69 name="TYPE"
+command client=69 name="DBSIZE"
+command client=69 name="KEYS"
+command client=69 name="SCAN"
+command client=69 name="RENAME"
+command client=69 name="GET"
+command client=69 name="CONFIG"
+command client=69 name="FLUSHALL"
+command client=69 name="DBSIZE"
+command client=70 name="GET"
+command client=71 name="AUTH"
+command client=72 name="AUTH"
+command client=72 name="WHOAMI"
+command client=72 name="AUTH"
+command client=72 name="SET"
+command client=72 name="SET"
+command client=73 name="AUTH"
+command client=73 name="GET"
+command client=74 name="AUTH"
+command client=74 name="SET"
+command client=74 name="GET"
+command client=72 name="GET"
+command client=72 name="DEL"
+command client=72 name="KEYS"
+command client=72 name="DBSIZE"
+command client=72 name="FLUSHALL"
+command client=72 name="GET"
+command client=72 name="SET"
+command client=74 name="GET"
+command client=72 name="QUIT"
+command client=75 name="AUTH"
+command client=75 name="GET"
+command client=2 name="PING"
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"event-loop-test" end time: Nov 10 00:46 IST
+"event-loop-test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/5 Testing: database-test
+3/5 Test: database-test
+Command: "/home/lemerux/Documents/GitHub/Redis_clone/build/database-test"
+Directory: /home/lemerux/Documents/GitHub/Redis_clone/build
+"database-test" start time: Nov 10 00:46 IST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"database-test" end time: Nov 10 00:46 IST
+"database-test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/5 Testing: container-command-test
+4/5 Test: container-command-test
+Command: "/home/lemerux/Documents/GitHub/Redis_clone/build/container-command-test"
+Directory: /home/lemerux/Documents/GitHub/Redis_clone/build
+"container-command-test" start time: Nov 10 00:46 IST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   1.33 sec
+----------------------------------------------------------
+Test Passed.
+"container-command-test" end time: Nov 10 00:46 IST
+"container-command-test" time elapsed: 00:00:01
+----------------------------------------------------------
+
+5/5 Testing: redis-differential-test
+5/5 Test: redis-differential-test
+Command: "/usr/bin/python3" "/home/lemerux/Documents/GitHub/Redis_clone/src/tests/redis_differential_test.py" "--clone" "/home/lemerux/Documents/GitHub/Redis_clone/build/redis-server" "--reference" "/usr/bin/redis-server"
+Directory: /home/lemerux/Documents/GitHub/Redis_clone/build
+"redis-differential-test" start time: Nov 10 00:46 IST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.42 sec
+----------------------------------------------------------
+Test Passed.
+"redis-differential-test" end time: Nov 10 00:46 IST
+"redis-differential-test" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 10 00:46 IST

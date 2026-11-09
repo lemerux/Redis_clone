@@ -23,7 +23,7 @@ public:
     Object* find(std::string_view key);
     const Object* find(std::string_view key) const;
     Object& findOrCreate(std::string key);
-    void setObject(std::string key, Object object);
+    void setObject(std::string key, Object object, bool keepTtl = false);
     void setString(std::string key, std::string value, bool keepTtl = false);
     bool setExpireAt(std::string_view key, std::int64_t deadlineMs);
     bool persist(std::string_view key);

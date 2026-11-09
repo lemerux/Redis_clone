@@ -36,31 +36,35 @@ Object& Database::findOrCreate(std::string key) {
     return *inserted;
 }
 
-void Database::setObject(std::string key, Object object) {
+void Database::setObject(std::string key, Object object, bool keepTtl) {
+    std::optional<std::int64_t> expiry;
+    if (keepTtl) {
+        find(key);
+        expiry = expiries_.deadline(key);
+    }
     if (Object* existing = find(key)) {
         const std::size_t oldSize = existing->logicalSize(key.size());
         const std::size_t newSize = object.logicalSize(key.size());
         *existing = std::move(object);
         usedBytes_ = usedBytes_ - oldSize + newSize;
         expiries_.erase(key);
+        if (expiry.has_value()) {
+            expiries_.set(key, *expiry);
+        }
         return;
     }
     const std::size_t addedBytes = object.logicalSize(key.size());
-    if (keys_.insert(std::move(key), std::move(object)) == nullptr) {
+    if (keys_.insert(key, std::move(object)) == nullptr) {
         throw std::logic_error("key insertion unexpectedly failed");
     }
     usedBytes_ += addedBytes;
+    if (expiry.has_value()) {
+        expiries_.set(key, *expiry);
+    }
 }
 
 void Database::setString(std::string key, std::string value, bool keepTtl) {
-    if (keepTtl) {
-        find(key);
-    }
-    const auto expiry = keepTtl ? expiries_.deadline(key) : std::nullopt;
-    setObject(key, Object{std::move(value)});
-    if (expiry.has_value()) {
-        expiries_.set(std::move(key), *expiry);
-    }
+    setObject(std::move(key), Object{std::move(value)}, keepTtl);
 }
 
 bool Database::setExpireAt(std::string_view key, std::int64_t deadlineMs) {
@@ -186,6 +190,9 @@ bool Database::rename(std::string_view source, std::string destination) {
 }
 
 std::size_t Database::size() const {
+    if (expiries_.size() == 0) {
+        return keys_.size();
+    }
     const std::vector<std::string> currentKeys = keys_.keys();
     std::size_t liveKeys = 0;
     for (const std::string& key : currentKeys) {

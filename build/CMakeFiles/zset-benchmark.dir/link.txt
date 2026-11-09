@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/zset-benchmark.dir/link.d "CMakeFiles/zset-benchmark.dir/benchmarks/zset_benchmark.cpp.o" -o zset-benchmark  libredis-store.a

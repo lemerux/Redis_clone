@@ -20,14 +20,14 @@ void testLogicalAccounting() {
     database.setString("alpha", "one");
     const std::size_t firstSize =
         sizeof(redis_clone::Object) + std::string("alpha").size() +
-        std::string("one").size();
+        std::string("one").capacity();
     expect(database.usedBytes() == firstSize,
            "insert must count key, value, and object overhead");
 
     database.setString("alpha", "longer");
     expect(database.usedBytes() ==
                sizeof(redis_clone::Object) + std::string("alpha").size() +
-                   std::string("longer").size(),
+                   std::string("longer").capacity(),
            "replacement must account for resized values");
 
     database.setString("beta", "");
@@ -35,7 +35,7 @@ void testLogicalAccounting() {
     expect(database.erase("alpha"), "erase should remove existing keys");
     expect(database.usedBytes() ==
                beforeErase - sizeof(redis_clone::Object) -
-                   std::string("alpha").size() - std::string("longer").size(),
+                   std::string("alpha").size() - std::string("longer").capacity(),
            "erase must subtract logical key and value sizes");
 
     database.flush();

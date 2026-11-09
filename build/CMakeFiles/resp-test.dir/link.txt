@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/resp-test.dir/link.d "CMakeFiles/resp-test.dir/tests/resp_test.cpp.o" -o resp-test  libredis-resp.a
