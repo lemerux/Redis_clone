@@ -123,7 +123,21 @@ std::vector<ZSet::Entry> selectRankRange(const ZSet& zset,
 }
 
 }  // namespace
-
+bool getMutableZSet(CommandContext& context, const std::string& key,
+                    Object*& object, ZSet*& zset) {
+    object = context.database.find(key);
+    if (object == nullptr) {
+        zset = nullptr;
+        return true;
+    }
+    auto* holder = std::get_if<std::unique_ptr<ZSet>>(&object->data);
+    if (holder == nullptr || *holder == nullptr) {
+        writeWrongTypeError(context.output);
+        return false;
+    }
+    zset = holder->get();
+    return true;
+}
 void cmd_zadd(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
     bool nx = false;
@@ -167,35 +181,35 @@ void cmd_zadd(CommandContext& context, const RespValue::Array& arguments) {
         updates.emplace_back(score, stringArgument(arguments, i + 1));
     }
 
-    const Object* existing = context.database.find(key);
-    const auto* holder =
-        existing == nullptr
-            ? nullptr
-            : std::get_if<std::unique_ptr<ZSet>>(&existing->data);
-    if (existing != nullptr && holder == nullptr) {
-        writeWrongTypeError(context.output);
+    Object* object = nullptr;
+    ZSet* zset = nullptr;
+    if (!getMutableZSet(context, key, object, zset)) {
         return;
     }
-    ZSet zset = (holder == nullptr || *holder == nullptr) ? ZSet{} : **holder;
+
+    if (object == nullptr) {
+        object = &context.database.findOrCreate(key);
+        object->type = ObjType::ZSet;
+        object->data = std::make_unique<ZSet>();
+        zset = std::get<std::unique_ptr<ZSet>>(object->data).get();
+    }
+
     std::size_t added = 0;
     std::size_t changed = 0;
     for (const auto& [newScore, member] : updates) {
-        const std::optional<double> oldScore = zset.score(member);
+        const std::optional<double> oldScore = zset->score(member);
         if (oldScore.has_value()) {
             if (nx || (gt && newScore <= *oldScore) ||
                 (lt && newScore >= *oldScore)) {
                 continue;
             }
-            if (*oldScore != newScore && zset.updateScore(member, newScore)) {
+            if (*oldScore != newScore && zset->updateScore(member, newScore)) {
                 ++changed;
             }
-        } else if (!xx && zset.add(newScore, member)) {
+        } else if (!xx && zset->add(newScore, member)) {
             ++added;
             ++changed;
         }
-    }
-    if (added != 0 || changed != 0) {
-        context.database.setObject(key, Object{std::move(zset)}, true);
     }
     RespWriter::writeInt(context.output,
                          static_cast<std::int64_t>(changedOnly ? changed : added));

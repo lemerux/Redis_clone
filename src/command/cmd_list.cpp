@@ -25,6 +25,10 @@ bool parseInteger(std::string_view text, std::int64_t& value) {
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size();
 }
 
+void writeBulkView(Buffer& output, std::string_view value) {
+    RespWriter::writeBulk(output, std::string(value));
+}
+
 std::optional<std::size_t> normalizeIndex(std::int64_t index,
                                           std::size_t length) {
     if (index >= 0) {
@@ -40,8 +44,9 @@ std::optional<std::size_t> normalizeIndex(std::int64_t index,
     return length - static_cast<std::size_t>(magnitude);
 }
 
-bool requireList(CommandContext& context, const std::string& key,
-                 const Object*& object, const List*& list) {
+// Helper returning non-const pointers for in-place mutation
+bool getMutableList(CommandContext& context, const std::string& key,
+                    Object*& object, List*& list) {
     object = context.database.find(key);
     list = object == nullptr ? nullptr : std::get_if<List>(&object->data);
     if (object != nullptr && list == nullptr) {
@@ -54,22 +59,25 @@ bool requireList(CommandContext& context, const std::string& key,
 void push(CommandContext& context, const RespValue::Array& arguments,
           bool left) {
     const std::string& key = stringArgument(arguments, 1);
-    const Object* existing = context.database.find(key);
-    if (existing != nullptr && std::get_if<List>(&existing->data) == nullptr) {
-        writeWrongTypeError(context.output);
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, key, object, list)) {
         return;
     }
-    List list = existing == nullptr ? List{} : std::get<List>(existing->data);
+    if (object == nullptr) {
+        object = &context.database.findOrCreate(key);
+        object->type = ObjType::List;
+        object->data = List{};
+        list = std::get_if<List>(&object->data);
+    }
     for (std::size_t i = 2; i < arguments.size(); ++i) {
         if (left) {
-            list.values.push_front(stringArgument(arguments, i));
+            list->values.push_front(stringArgument(arguments, i));
         } else {
-            list.values.push_back(stringArgument(arguments, i));
+            list->values.push_back(stringArgument(arguments, i));
         }
     }
-    const auto length = static_cast<std::int64_t>(list.values.size());
-    context.database.setObject(key, Object{std::move(list)}, true);
-    RespWriter::writeInt(context.output, length);
+    RespWriter::writeInt(context.output, static_cast<std::int64_t>(list->values.size()));
 }
 
 void pop(CommandContext& context, const RespValue::Array& arguments,
@@ -83,12 +91,12 @@ void pop(CommandContext& context, const RespValue::Array& arguments,
                                "ERR value is out of range, must be positive");
         return;
     }
-    const Object* object = nullptr;
-    const List* existing = nullptr;
-    if (!requireList(context, key, object, existing)) {
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, key, object, list)) {
         return;
     }
-    if (existing == nullptr) {
+    if (list == nullptr || list->values.empty()) {
         if (withCount) {
             RespWriter::writeArrayHeader(context.output, 0);
         } else {
@@ -97,28 +105,23 @@ void pop(CommandContext& context, const RespValue::Array& arguments,
         return;
     }
     const std::size_t popped = std::min<std::uint64_t>(
-        static_cast<std::uint64_t>(count), existing->values.size());
+        static_cast<std::uint64_t>(count), list->values.size());
     if (withCount) {
         RespWriter::writeArrayHeader(context.output, popped);
     }
-    List updated = *existing;
+    std::string scratch;
     for (std::size_t i = 0; i < popped; ++i) {
-        const std::string value = left
-                                      ? updated.values[0]
-                                      : updated.values[updated.values.size() - 1];
+        const std::size_t idx = left ? 0 : list->values.size() - 1;
+        const std::string_view valueView = list->values.peek(idx, scratch);
+        RespWriter::writeBulk(context.output, std::string(valueView));
         if (left) {
-            updated.values.pop_front();
+            list->values.pop_front();
         } else {
-            updated.values.pop_back();
+            list->values.pop_back();
         }
-        RespWriter::writeBulk(context.output, value);
     }
-    if (popped != 0) {
-        if (updated.values.empty()) {
-            context.database.erase(key);
-        } else {
-            context.database.setObject(key, Object{std::move(updated)}, true);
-        }
+    if (list->values.empty()) {
+        context.database.erase(key);
     }
 }
 
@@ -141,9 +144,9 @@ void cmd_rpop(CommandContext& context, const RespValue::Array& arguments) {
 }
 
 void cmd_llen(CommandContext& context, const RespValue::Array& arguments) {
-    const Object* object = nullptr;
-    const List* list = nullptr;
-    if (!requireList(context, stringArgument(arguments, 1), object, list)) {
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, stringArgument(arguments, 1), object, list)) {
         return;
     }
     RespWriter::writeInt(
@@ -160,9 +163,9 @@ void cmd_lrange(CommandContext& context, const RespValue::Array& arguments) {
                                "ERR value is not an integer or out of range");
         return;
     }
-    const Object* object = nullptr;
-    const List* list = nullptr;
-    if (!requireList(context, stringArgument(arguments, 1), object, list)) {
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, stringArgument(arguments, 1), object, list)) {
         return;
     }
     if (list == nullptr || list->values.empty()) {
@@ -170,7 +173,10 @@ void cmd_lrange(CommandContext& context, const RespValue::Array& arguments) {
         return;
     }
     const std::size_t length = list->values.size();
-    const auto start = normalizeIndex(startIndex, length);
+    std::optional<std::size_t> start = normalizeIndex(startIndex, length);
+    if (!start.has_value() && startIndex < 0) {
+        start = 0; // Fixed: Clamp out-of-bounds negative start index to 0
+    }
     if (!start.has_value()) {
         RespWriter::writeArrayHeader(context.output, 0);
         return;
@@ -183,10 +189,11 @@ void cmd_lrange(CommandContext& context, const RespValue::Array& arguments) {
         RespWriter::writeArrayHeader(context.output, 0);
         return;
     }
-    RespWriter::writeArrayHeader(context.output, *stop - *start + 1);
-    for (std::size_t index = *start; index <= *stop; ++index) {
-        RespWriter::writeBulk(context.output, list->values[index]);
-    }
+    const std::size_t count = *stop - *start + 1;
+    RespWriter::writeArrayHeader(context.output, count);
+    list->values.forEachRange(*start, count, [&](std::string_view value) {
+        writeBulkView(context.output, value);
+    });
 }
 
 void cmd_lindex(CommandContext& context, const RespValue::Array& arguments) {
@@ -196,9 +203,9 @@ void cmd_lindex(CommandContext& context, const RespValue::Array& arguments) {
                                "ERR value is not an integer or out of range");
         return;
     }
-    const Object* object = nullptr;
-    const List* list = nullptr;
-    if (!requireList(context, stringArgument(arguments, 1), object, list)) {
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, stringArgument(arguments, 1), object, list)) {
         return;
     }
     const auto normalized =
@@ -207,7 +214,8 @@ void cmd_lindex(CommandContext& context, const RespValue::Array& arguments) {
         RespWriter::writeNull(context.output);
         return;
     }
-    RespWriter::writeBulk(context.output, list->values[*normalized]);
+    std::string scratch;
+    writeBulkView(context.output, list->values.peek(*normalized, scratch));
 }
 
 void cmd_lset(CommandContext& context, const RespValue::Array& arguments) {
@@ -218,9 +226,9 @@ void cmd_lset(CommandContext& context, const RespValue::Array& arguments) {
                                "ERR value is not an integer or out of range");
         return;
     }
-    const Object* object = nullptr;
-    const List* list = nullptr;
-    if (!requireList(context, key, object, list)) {
+    Object* object = nullptr;
+    List* list = nullptr;
+    if (!getMutableList(context, key, object, list)) {
         return;
     }
     if (list == nullptr) {
@@ -232,9 +240,8 @@ void cmd_lset(CommandContext& context, const RespValue::Array& arguments) {
         RespWriter::writeError(context.output, "ERR index out of range");
         return;
     }
-    List updated = *list;
-    updated.values[*normalized] = stringArgument(arguments, 3);
-    context.database.setObject(key, Object{std::move(updated)}, true);
+    // Fixed: Mutate directly in-place without deep-copying the list
+    list->values.set(*normalized, stringArgument(arguments, 3));
     RespWriter::writeOk(context.output);
 }
 

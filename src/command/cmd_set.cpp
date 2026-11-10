@@ -136,21 +136,34 @@ void setOperation(CommandContext& context, const RespValue::Array& arguments,
 }
 
 }  // namespace
-
+bool getMutableSet(CommandContext& context, const std::string& key,
+                   Object*& object, Set*& set) {
+    object = context.database.find(key);
+    set = object == nullptr ? nullptr : std::get_if<Set>(&object->data);
+    if (object != nullptr && set == nullptr) {
+        writeWrongTypeError(context.output);
+        return false;
+    }
+    return true;
+}
 void cmd_sadd(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
-    const Object* existing = context.database.find(key);
-    if (existing != nullptr && std::get_if<Set>(&existing->data) == nullptr) {
-        writeWrongTypeError(context.output);
+    Object* object = nullptr;
+    Set* set = nullptr;
+    if (!getMutableSet(context, key, object, set)) {
         return;
     }
-    Set set = existing == nullptr ? Set{} : std::get<Set>(existing->data);
+
+    if (object == nullptr) {
+        object = &context.database.findOrCreate(key);
+        object->type = ObjType::Set;
+        object->data = Set{};
+        set = std::get_if<Set>(&object->data);
+    }
+
     std::size_t added = 0;
     for (std::size_t i = 2; i < arguments.size(); ++i) {
-        added += set.values.emplace(stringArgument(arguments, i)).second ? 1 : 0;
-    }
-    if (added != 0) {
-        context.database.setObject(key, Object{std::move(set)}, true);
+        added += set->values.emplace(stringArgument(arguments, i)).second ? 1 : 0;
     }
     RespWriter::writeInt(context.output, static_cast<std::int64_t>(added));
 }
