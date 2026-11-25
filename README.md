@@ -116,10 +116,13 @@ Every object tracks its payload size through [`Object::logicalSize(keySize)`](fi
 
 $$\text{logicalSize} = \text{key.size()} + \operatorname{sizeof}(\text{Object}) + \text{dataPayloadBytes}$$
 
-Whenever a key is inserted, replaced, or erased:
-- Inserting a key adds its `logicalSize` to `usedBytes_`.
-- Updating a key adjusts `usedBytes_ = usedBytes_ - oldSize + newSize`.
+Whenever a key is inserted, replaced, modified, or erased:
+- Inserting a key (`create` / `setObject`) adds its `logicalSize` to `usedBytes_`.
+- Replacing a key (`setObject`) adjusts `usedBytes_ = usedBytes_ - oldSize + newSize`.
+- Modifying a collection in place (`modify`) measures `logicalSize` before and after the change and applies the difference.
 - Erasing a key deducts its `logicalSize`.
+
+`logicalSize` is $O(1)$ for every type. `Hash`, `Set` and the `ZSet` skip list keep a running count of the heap bytes held by their strings and nodes, so measuring a collection after a write never walks its elements. The invariant `usedBytes() == Σ logicalSize(key)` over all live keys is checked after every write command in `container-command-test`.
 
 ---
 
@@ -150,7 +153,7 @@ sequenceDiagram
     Parser-->>Loop: ParseResult (RespValue::Array of BulkStrings)
     Loop->>Cmd: dispatchCommand(connection, value)
     Cmd->>Cmd: Verify AUTH status & argument counts
-    Cmd->>DB: Execute handler (e.g. cmd_sadd -> database.setObject)
+    Cmd->>DB: Execute handler (e.g. cmd_sadd -> database.modify)
     DB-->>Cmd: Result / modified state
     Cmd->>Conn: RespWriter::writeInt(output, 2)
     Loop->>Conn: writeSome() to client socket
@@ -213,9 +216,12 @@ enum class ObjType {
     ZSet,
 };
 
-struct Hash { std::unordered_map<std::string, std::string> values; };
+// Hash and Set expose their contents read-only through values() and are
+// changed only through set()/insert()/erase(), which keep a running count of
+// string bytes so memoryUsage() is O(1).
+class Hash { /* std::unordered_map<std::string, std::string> values_; */ };
 struct List { ListValues values; };
-struct Set  { std::unordered_set<std::string> values; };
+class Set  { /* std::unordered_set<std::string> values_; */ };
 
 struct Object {
     using Data = std::variant<std::string, Hash, List, Set, ZSet>;
@@ -236,9 +242,11 @@ This design gives type safety without virtual dispatch overhead:
 ### Dynamic Typing on First Write
 
 When a command touches a key:
-- If the key does not exist, an empty container corresponding to the command's type is created, populated, wrapped in an `Object`, and inserted into the `Database`.
+- If the key does not exist, an empty container of the command's type is inserted with `Database::create`, then filled in place.
 - If the key exists but holds a different type, the command fails with `WRONGTYPE`.
-- If the key exists and holds the matching type, the command mutates the existing container.
+- If the key exists and holds the matching type, the command mutates the existing container in place through `Database::modify`. Nothing is copied, so a write costs time proportional to the elements it touches, not to the collection's size.
+- If a write leaves a collection empty (for example `SREM` of the last member), `modify` deletes the key, as Redis does.
+- `ZADD ... XX` on a missing key adds nothing and does not create the key.
 
 | Redis Type | C++ Container | Command that Declares It |
 |---|---|---|
@@ -255,68 +263,68 @@ Let us trace how executing `SADD fruits apple banana` declares and stores a `Set
 ```cpp
 void cmd_sadd(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
-    
-    // Step 1: Look up existing key in database (triggers lazy expiry if expired)
-    const Object* existing = context.database.find(key);
-    
-    // Step 2: Validate existing type
-    if (existing != nullptr && std::get_if<Set>(&existing->data) == nullptr) {
-        writeWrongTypeError(context.output); // Returns -WRONGTYPE ...
+
+    // Step 1: Look up the key (triggers lazy expiry) and validate its type.
+    //         getMutableSet writes -WRONGTYPE and returns false on a mismatch.
+    Object* object = nullptr;
+    Set* set = nullptr;
+    if (!getMutableSet(context, key, object, set)) {
         return;
     }
 
-    // Step 3: Instantiate new Set{} or copy existing Set
-    Set set = existing == nullptr ? Set{} : std::get<Set>(existing->data);
-    
-    // Step 4: Emplace elements into the unordered_set
+    // Step 2: Declare the type on first write by inserting an empty Set.
+    if (object == nullptr) {
+        object = &context.database.create(key, Object{Set{}});
+    }
+
+    // Step 3: Add the members in place. modify() keeps usedBytes exact and
+    //         leaves the key's TTL untouched.
     std::size_t added = 0;
-    for (std::size_t i = 2; i < arguments.size(); ++i) {
-        added += set.values.emplace(stringArgument(arguments, i)).second ? 1 : 0;
-    }
+    context.database.modify(key, *object, [&](Object& value) {
+        Set& members = std::get<Set>(value.data);
+        for (std::size_t i = 2; i < arguments.size(); ++i) {
+            if (members.insert(stringArgument(arguments, i))) {
+                ++added;
+            }
+        }
+    });
 
-    // Step 5: Store back into Database as an Object with keepTtl=true
-    if (added != 0) {
-        context.database.setObject(key, Object{std::move(set)}, true);
-    }
-
-    // Step 6: Reply with number of newly added elements
+    // Step 4: Reply with the number of newly added members.
     RespWriter::writeInt(context.output, static_cast<std::int64_t>(added));
 }
 ```
 
-#### What happens inside `Database::setObject`:
+#### What happens inside `Database::create` and `Database::modify`:
 ```cpp
-void Database::setObject(std::string key, Object object, bool keepTtl) {
-    std::optional<std::int64_t> expiry;
-    if (keepTtl) {
-        find(key);
-        expiry = expiries_.deadline(key);
-    }
-    if (Object* existing = find(key)) {
-        const std::size_t oldSize = existing->logicalSize(key.size());
-        const std::size_t newSize = object.logicalSize(key.size());
-        *existing = std::move(object);
-        usedBytes_ = usedBytes_ - oldSize + newSize;
-        expiries_.erase(key);
-        if (expiry.has_value()) {
-            expiries_.set(key, *expiry);
-        }
-        return;
-    }
+Object& Database::create(std::string key, Object object) {
     const std::size_t addedBytes = object.logicalSize(key.size());
-    if (keys_.insert(key, std::move(object)) == nullptr) {
-        throw std::logic_error("key insertion unexpectedly failed");
+    Object* inserted = keys_.insert(std::move(key), std::move(object));
+    if (inserted == nullptr) {
+        throw std::logic_error("create called for an existing key");
     }
     usedBytes_ += addedBytes;
-    if (expiry.has_value()) {
-        expiries_.set(key, *expiry);
+    return *inserted;
+}
+
+template <class Mutation>
+void Database::modify(std::string_view key, Object& object, Mutation&& mutation) {
+    const std::size_t sizeBefore = object.logicalSize(key.size());
+    mutation(object);  // (also re-accounted if the mutation throws)
+    finishModify(key, object, sizeBefore);
+}
+
+void Database::finishModify(std::string_view key, const Object& object,
+                            std::size_t sizeBefore) {
+    usedBytes_ = usedBytes_ - sizeBefore + object.logicalSize(key.size());
+    if (object.isEmptyCollection()) {
+        eraseInternal(key, false);
     }
 }
 ```
-1. `Object{std::move(set)}` sets `type = ObjType::Set` and assigns the `std::unordered_set` into `data`.
-2. `keys_.insert(...)` inserts the entry into `KeyTable`.
-3. `usedBytes_` increments by the size of the key, `sizeof(Object)`, and the sum of lengths of all string elements inside the set.
-4. If the key already had a TTL, passing `keepTtl = true` preserves the existing expiration deadline in `ExpiryIndex`.
+1. `Object{Set{}}` sets `type = ObjType::Set`, and `create` inserts it into `KeyTable`, adding its `logicalSize` to `usedBytes_`.
+2. `modify` runs the change directly on the stored `Set`, with no copy of the existing members.
+3. Because `Set::insert` keeps a running count of member bytes, both `logicalSize` calls are $O(1)$. `usedBytes_` moves by exactly the bytes the new members added.
+4. The TTL lives in `ExpiryIndex` and is never touched by `modify`, so an existing expiry is preserved automatically.
 
 ---
 
