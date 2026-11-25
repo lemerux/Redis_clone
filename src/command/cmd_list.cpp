@@ -65,19 +65,21 @@ void push(CommandContext& context, const RespValue::Array& arguments,
         return;
     }
     if (object == nullptr) {
-        object = &context.database.findOrCreate(key);
-        object->type = ObjType::List;
-        object->data = List{};
-        list = std::get_if<List>(&object->data);
+        object = &context.database.create(key, Object{List{}});
     }
-    for (std::size_t i = 2; i < arguments.size(); ++i) {
-        if (left) {
-            list->values.push_front(stringArgument(arguments, i));
-        } else {
-            list->values.push_back(stringArgument(arguments, i));
+    std::size_t length = 0;
+    context.database.modify(key, *object, [&](Object& value) {
+        ListValues& values = std::get<List>(value.data).values;
+        for (std::size_t i = 2; i < arguments.size(); ++i) {
+            if (left) {
+                values.push_front(stringArgument(arguments, i));
+            } else {
+                values.push_back(stringArgument(arguments, i));
+            }
         }
-    }
-    RespWriter::writeInt(context.output, static_cast<std::int64_t>(list->values.size()));
+        length = values.size();
+    });
+    RespWriter::writeInt(context.output, static_cast<std::int64_t>(length));
 }
 
 void pop(CommandContext& context, const RespValue::Array& arguments,
@@ -109,20 +111,19 @@ void pop(CommandContext& context, const RespValue::Array& arguments,
     if (withCount) {
         RespWriter::writeArrayHeader(context.output, popped);
     }
-    std::string scratch;
-    for (std::size_t i = 0; i < popped; ++i) {
-        const std::size_t idx = left ? 0 : list->values.size() - 1;
-        const std::string_view valueView = list->values.peek(idx, scratch);
-        RespWriter::writeBulk(context.output, std::string(valueView));
-        if (left) {
-            list->values.pop_front();
-        } else {
-            list->values.pop_back();
+    context.database.modify(key, *object, [&](Object& value) {
+        ListValues& values = std::get<List>(value.data).values;
+        std::string scratch;
+        for (std::size_t i = 0; i < popped; ++i) {
+            const std::size_t index = left ? 0 : values.size() - 1;
+            RespWriter::writeBulk(context.output, values.peek(index, scratch));
+            if (left) {
+                values.pop_front();
+            } else {
+                values.pop_back();
+            }
         }
-    }
-    if (list->values.empty()) {
-        context.database.erase(key);
-    }
+    });
 }
 
 }  // namespace
@@ -240,8 +241,10 @@ void cmd_lset(CommandContext& context, const RespValue::Array& arguments) {
         RespWriter::writeError(context.output, "ERR index out of range");
         return;
     }
-    // Fixed: Mutate directly in-place without deep-copying the list
-    list->values.set(*normalized, stringArgument(arguments, 3));
+    context.database.modify(key, *object, [&](Object& value) {
+        std::get<List>(value.data).values.set(*normalized,
+                                              stringArgument(arguments, 3));
+    });
     RespWriter::writeOk(context.output);
 }
 

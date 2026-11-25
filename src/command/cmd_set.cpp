@@ -59,7 +59,7 @@ std::mt19937_64& randomEngine() {
 
 std::vector<std::string> randomElements(const Set& set, std::size_t count,
                                         bool allowDuplicates) {
-    std::vector<std::string> elements(set.values.begin(), set.values.end());
+    std::vector<std::string> elements(set.values().begin(), set.values().end());
     std::vector<std::string> result;
     if (elements.empty() || count == 0) {
         return result;
@@ -100,19 +100,19 @@ void setOperation(CommandContext& context, const RespValue::Array& arguments,
     if (operation == 0) {
         for (const Set* set : sets) {
             if (set != nullptr) {
-                result.insert(set->values.begin(), set->values.end());
+                result.insert(set->values().begin(), set->values().end());
             }
         }
     } else if (operation == 1) {
         if (!sets.empty() && sets.front() != nullptr) {
-            result = sets.front()->values;
+            result = sets.front()->values();
             for (std::size_t i = 1; i < sets.size(); ++i) {
                 if (sets[i] == nullptr) {
                     result.clear();
                     break;
                 }
                 for (auto it = result.begin(); it != result.end();) {
-                    if (sets[i]->values.count(*it) == 0) {
+                    if (sets[i]->values().count(*it) == 0) {
                         it = result.erase(it);
                     } else {
                         ++it;
@@ -121,12 +121,12 @@ void setOperation(CommandContext& context, const RespValue::Array& arguments,
             }
         }
     } else if (!sets.empty() && sets.front() != nullptr) {
-        result = sets.front()->values;
+        result = sets.front()->values();
         for (std::size_t i = 1; i < sets.size(); ++i) {
             if (sets[i] == nullptr) {
                 continue;
             }
-            for (const std::string& value : sets[i]->values) {
+            for (const std::string& value : sets[i]->values()) {
                 result.erase(value);
             }
         }
@@ -155,41 +155,38 @@ void cmd_sadd(CommandContext& context, const RespValue::Array& arguments) {
     }
 
     if (object == nullptr) {
-        object = &context.database.findOrCreate(key);
-        object->type = ObjType::Set;
-        object->data = Set{};
-        set = std::get_if<Set>(&object->data);
+        object = &context.database.create(key, Object{Set{}});
     }
 
     std::size_t added = 0;
-    for (std::size_t i = 2; i < arguments.size(); ++i) {
-        added += set->values.emplace(stringArgument(arguments, i)).second ? 1 : 0;
-    }
+    context.database.modify(key, *object, [&](Object& value) {
+        Set& members = std::get<Set>(value.data);
+        for (std::size_t i = 2; i < arguments.size(); ++i) {
+            if (members.insert(stringArgument(arguments, i))) {
+                ++added;
+            }
+        }
+    });
     RespWriter::writeInt(context.output, static_cast<std::int64_t>(added));
 }
 
 void cmd_srem(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
-    const Object* object = nullptr;
-    const Set* existing = nullptr;
-    if (!requireSet(context, key, object, existing)) {
+    Object* object = nullptr;
+    Set* set = nullptr;
+    if (!getMutableSet(context, key, object, set)) {
         return;
     }
-    if (existing == nullptr) {
-        RespWriter::writeInt(context.output, 0);
-        return;
-    }
-    Set updated = *existing;
     std::size_t removed = 0;
-    for (std::size_t i = 2; i < arguments.size(); ++i) {
-        removed += updated.values.erase(stringArgument(arguments, i));
-    }
-    if (removed != 0) {
-        if (updated.values.empty()) {
-            context.database.erase(key);
-        } else {
-            context.database.setObject(key, Object{std::move(updated)}, true);
-        }
+    if (object != nullptr) {
+        context.database.modify(key, *object, [&](Object& value) {
+            Set& members = std::get<Set>(value.data);
+            for (std::size_t i = 2; i < arguments.size(); ++i) {
+                if (members.erase(stringArgument(arguments, i))) {
+                    ++removed;
+                }
+            }
+        });
     }
     RespWriter::writeInt(context.output, static_cast<std::int64_t>(removed));
 }
@@ -203,7 +200,7 @@ void cmd_sismember(CommandContext& context,
     }
     RespWriter::writeInt(
         context.output,
-        set != nullptr && set->values.count(stringArgument(arguments, 2)) != 0
+        set != nullptr && set->values().count(stringArgument(arguments, 2)) != 0
             ? 1
             : 0);
 }
@@ -216,7 +213,7 @@ void cmd_smembers(CommandContext& context, const RespValue::Array& arguments) {
     }
     std::vector<std::string> values;
     if (set != nullptr) {
-        values.assign(set->values.begin(), set->values.end());
+        values.assign(set->values().begin(), set->values().end());
     }
     writeStringArray(context.output, values);
 }
@@ -229,7 +226,7 @@ void cmd_scard(CommandContext& context, const RespValue::Array& arguments) {
     }
     RespWriter::writeInt(
         context.output,
-        set == nullptr ? 0 : static_cast<std::int64_t>(set->values.size()));
+        set == nullptr ? 0 : static_cast<std::int64_t>(set->values().size()));
 }
 
 void cmd_sinter(CommandContext& context, const RespValue::Array& arguments) {
@@ -254,9 +251,9 @@ void cmd_spop(CommandContext& context, const RespValue::Array& arguments) {
                                "ERR value is out of range, must be positive");
         return;
     }
-    const Object* object = nullptr;
-    const Set* set = nullptr;
-    if (!requireSet(context, key, object, set)) {
+    Object* object = nullptr;
+    Set* set = nullptr;
+    if (!getMutableSet(context, key, object, set)) {
         return;
     }
     if (set == nullptr) {
@@ -267,21 +264,16 @@ void cmd_spop(CommandContext& context, const RespValue::Array& arguments) {
         }
         return;
     }
-    Set updated = *set;
     const auto values = randomElements(
-        updated, static_cast<std::size_t>(std::min<std::uint64_t>(
-                     static_cast<std::uint64_t>(count), updated.values.size())),
+        *set, static_cast<std::size_t>(std::min<std::uint64_t>(
+                  static_cast<std::uint64_t>(count), set->values().size())),
         false);
-    for (const std::string& value : values) {
-        updated.values.erase(value);
-    }
-    if (!values.empty()) {
-        if (updated.values.empty()) {
-            context.database.erase(key);
-        } else {
-            context.database.setObject(key, Object{std::move(updated)}, true);
+    context.database.modify(key, *object, [&](Object& value) {
+        Set& members = std::get<Set>(value.data);
+        for (const std::string& member : values) {
+            members.erase(member);
         }
-    }
+    });
     if (withCount) {
         writeStringArray(context.output, values);
     } else if (values.empty()) {

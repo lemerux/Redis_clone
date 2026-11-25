@@ -23,17 +23,22 @@ const Object* Database::find(std::string_view key) const {
     return const_cast<Database*>(this)->find(key);
 }
 
-Object& Database::findOrCreate(std::string key) {
-    if (Object* existing = find(key)) {
-        return *existing;
-    }
-    const std::size_t addedBytes = key.size() + sizeof(Object);
-    Object* inserted = keys_.insert(std::move(key), Object{});
+Object& Database::create(std::string key, Object object) {
+    const std::size_t addedBytes = object.logicalSize(key.size());
+    Object* inserted = keys_.insert(std::move(key), std::move(object));
     if (inserted == nullptr) {
-        throw std::logic_error("key insertion unexpectedly failed");
+        throw std::logic_error("create called for an existing key");
     }
     usedBytes_ += addedBytes;
     return *inserted;
+}
+
+void Database::finishModify(std::string_view key, const Object& object,
+                            std::size_t sizeBefore) {
+    usedBytes_ = usedBytes_ - sizeBefore + object.logicalSize(key.size());
+    if (object.isEmptyCollection()) {
+        eraseInternal(key, false);
+    }
 }
 
 void Database::setObject(std::string key, Object object, bool keepTtl) {
@@ -171,17 +176,21 @@ bool Database::eraseInternal(std::string_view key, bool notify) {
 }
 
 bool Database::rename(std::string_view source, std::string destination) {
-    const Object* existing = find(source);
-    if (existing == nullptr) {
+    if (find(source) == nullptr) {
         return false;
     }
     if (source == destination) {
         return true;
     }
-    Object value = *existing;
-    const auto expiry = expiries_.deadline(source);
     erase(destination);
-    erase(source);
+    // Move the value instead of copying it. Its size is read before the move
+    // so the bytes subtracted match the bytes setObject adds back.
+    Object* existing = keys_.find(source);
+    const auto expiry = expiries_.deadline(source);
+    usedBytes_ -= existing->logicalSize(source.size());
+    Object value = std::move(*existing);
+    keys_.erase(source);
+    expiries_.erase(source);
     setObject(destination, std::move(value));
     if (expiry.has_value()) {
         setExpireAt(destination, *expiry);

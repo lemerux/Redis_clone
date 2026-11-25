@@ -460,36 +460,129 @@ struct List {
     std::size_t memoryUsage() const noexcept { return values.memoryUsage(); }
 };
 
-struct Hash {
-    std::unordered_map<std::string, std::string> values;
+// Hash and Set are mutated only through their member functions so that the
+// heap bytes held by their strings are tracked incrementally. That keeps
+// memoryUsage() O(1), which lets commands modify a collection in place without
+// an O(n) walk to re-account it.
+class Hash {
+public:
+    using Map = std::unordered_map<std::string, std::string>;
+
+    Hash() = default;
+    Hash(const Hash& other) : values_(other.values_), stringBytes_(countBytes(values_)) {}
+    Hash& operator=(const Hash& other) {
+        if (this != &other) {
+            Hash copy(other);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
+    Hash(Hash&&) noexcept = default;
+    Hash& operator=(Hash&&) noexcept = default;
+
+    const Map& values() const noexcept { return values_; }
+
+    // Inserts or overwrites `field`. Returns true when the field is new.
+    bool set(const std::string& field, std::string_view value) {
+        const auto found = values_.find(field);
+        if (found != values_.end()) {
+            stringBytes_ -= found->second.capacity();
+            found->second.assign(value);
+            stringBytes_ += found->second.capacity();
+            return false;
+        }
+        const auto inserted = values_.emplace(field, std::string(value)).first;
+        stringBytes_ += inserted->first.capacity() + inserted->second.capacity();
+        return true;
+    }
+
+    bool erase(const std::string& field) {
+        const auto found = values_.find(field);
+        if (found == values_.end()) {
+            return false;
+        }
+        stringBytes_ -= found->first.capacity() + found->second.capacity();
+        values_.erase(found);
+        return true;
+    }
 
     std::size_t memoryUsage() const noexcept {
         std::size_t bytes = 0;
-        if (!values.empty()) {
-            bytes += (values.bucket_count() + 1) * sizeof(void*);
+        if (!values_.empty()) {
+            bytes += (values_.bucket_count() + 1) * sizeof(void*);
         }
-        bytes += values.size() * 80;
+        return bytes + values_.size() * 80 + stringBytes_;
+    }
+
+private:
+    static std::size_t countBytes(const Map& values) noexcept {
+        std::size_t bytes = 0;
         for (const auto& [field, value] : values) {
             bytes += field.capacity() + value.capacity();
         }
         return bytes;
     }
+
+    Map values_;
+    std::size_t stringBytes_ = 0;
 };
 
-struct Set {
-    std::unordered_set<std::string> values;
+class Set {
+public:
+    using Values = std::unordered_set<std::string>;
+
+    Set() = default;
+    Set(const Set& other) : values_(other.values_), stringBytes_(countBytes(values_)) {}
+    Set& operator=(const Set& other) {
+        if (this != &other) {
+            Set copy(other);
+            *this = std::move(copy);
+        }
+        return *this;
+    }
+    Set(Set&&) noexcept = default;
+    Set& operator=(Set&&) noexcept = default;
+
+    const Values& values() const noexcept { return values_; }
+
+    // Returns true when `member` was not already present.
+    bool insert(const std::string& member) {
+        const auto [position, inserted] = values_.insert(member);
+        if (inserted) {
+            stringBytes_ += position->capacity();
+        }
+        return inserted;
+    }
+
+    bool erase(const std::string& member) {
+        const auto found = values_.find(member);
+        if (found == values_.end()) {
+            return false;
+        }
+        stringBytes_ -= found->capacity();
+        values_.erase(found);
+        return true;
+    }
 
     std::size_t memoryUsage() const noexcept {
         std::size_t bytes = 0;
-        if (!values.empty()) {
-            bytes += (values.bucket_count() + 1) * sizeof(void*);
+        if (!values_.empty()) {
+            bytes += (values_.bucket_count() + 1) * sizeof(void*);
         }
-        bytes += values.size() * 48;
+        return bytes + values_.size() * 48 + stringBytes_;
+    }
+
+private:
+    static std::size_t countBytes(const Values& values) noexcept {
+        std::size_t bytes = 0;
         for (const auto& value : values) {
             bytes += value.capacity();
         }
         return bytes;
     }
+
+    Values values_;
+    std::size_t stringBytes_ = 0;
 };
 
 struct Object {
@@ -563,6 +656,24 @@ struct Object {
             }
         }
         return size;
+    }
+
+    // True for a hash, list, set or sorted set with no elements. Redis never
+    // keeps such keys, so writers delete the key when this becomes true.
+    bool isEmptyCollection() const noexcept {
+        if (const auto* hash = std::get_if<Hash>(&data)) {
+            return hash->values().empty();
+        }
+        if (const auto* list = std::get_if<List>(&data)) {
+            return list->values.empty();
+        }
+        if (const auto* set = std::get_if<Set>(&data)) {
+            return set->values().empty();
+        }
+        if (const auto* sortedSet = std::get_if<std::unique_ptr<ZSet>>(&data)) {
+            return *sortedSet == nullptr || (*sortedSet)->size() == 0;
+        }
+        return false;
     }
 
     ObjType type;

@@ -42,12 +42,24 @@ SkipList::SkipList(const SkipList& other)
     }
 }
 
+SkipList::SkipList(SkipList&& other) noexcept
+    : head_(std::move(other.head_)),
+      currentLevel_(other.currentLevel_),
+      size_(other.size_),
+      nodeBytes_(other.nodeBytes_),
+      promotionProbability_(other.promotionProbability_) {
+    other.currentLevel_ = 1;
+    other.size_ = 0;
+    other.nodeBytes_ = 0;
+}
+
 SkipList& SkipList::operator=(const SkipList& other) {
     if (this != &other) {
         SkipList copy(other);
         std::swap(head_, copy.head_);
         std::swap(currentLevel_, copy.currentLevel_);
         std::swap(size_, copy.size_);
+        std::swap(nodeBytes_, copy.nodeBytes_);
         std::swap(promotionProbability_, copy.promotionProbability_);
     }
     return *this;
@@ -59,9 +71,11 @@ SkipList& SkipList::operator=(SkipList&& other) noexcept {
         head_ = std::move(other.head_);
         currentLevel_ = other.currentLevel_;
         size_ = other.size_;
+        nodeBytes_ = other.nodeBytes_;
         promotionProbability_ = other.promotionProbability_;
         other.currentLevel_ = 1;
         other.size_ = 0;
+        other.nodeBytes_ = 0;
     }
     return *this;
 }
@@ -81,6 +95,11 @@ bool SkipList::setPromotionProbability(double probability) noexcept {
 
 double SkipList::promotionProbability() const noexcept {
     return promotionProbability_;
+}
+
+std::size_t SkipList::nodeBytes(const Node& node) noexcept {
+    return sizeof(Node) + node.member.capacity() +
+           node.levels.capacity() * sizeof(Level);
 }
 
 bool SkipList::less(double leftScore, const std::string& leftMember,
@@ -171,6 +190,7 @@ bool SkipList::insert(double score, std::string member) {
     if (inserted->levels[0].forward != nullptr) {
         inserted->levels[0].forward->backward = inserted.get();
     }
+    nodeBytes_ += nodeBytes(*inserted);
     inserted.release();
     ++size_;
     return true;
@@ -205,6 +225,7 @@ bool SkipList::erase(double score, const std::string& member) {
     if (target->levels[0].forward != nullptr) {
         target->levels[0].forward->backward = target->backward;
     }
+    nodeBytes_ -= nodeBytes(*target);
     delete target;
     while (currentLevel_ > 1 &&
            head_->levels[currentLevel_ - 1].forward == nullptr) {
@@ -342,6 +363,7 @@ void SkipList::clear() noexcept {
     }
     currentLevel_ = 1;
     size_ = 0;
+    nodeBytes_ = 0;
 }
 
 ZSet::ZSet(const ZSet& other) : skipList_(other.skipList_) {
@@ -465,13 +487,7 @@ std::size_t ZSet::logicalSize() const noexcept {
     if (!members_.empty()) {
         size += (members_.bucket_count() + 1) * sizeof(void*);
     }
-    size += members_.size() * 40;
-    for (SkipList::Node* node = skipList_.head_->levels[0].forward;
-         node != nullptr; node = node->levels[0].forward) {
-        size += sizeof(SkipList::Node) + node->member.capacity() +
-                node->levels.capacity() * sizeof(SkipList::Level);
-    }
-    return size;
+    return size + members_.size() * 40 + skipList_.nodeBytes_;
 }
 
 std::size_t ZSet::memoryUsage() const noexcept {

@@ -383,6 +383,68 @@ void testWrongType(CommandContext& context, const CommandTable& table) {
 
 }  // namespace
 
+// usedBytes() must always equal the sum of every live object's logical size.
+void expectAccountingExact(CommandContext& context, const char* step) {
+    std::size_t expected = 0;
+    for (const std::string& key : context.database.keys()) {
+        expected += context.database.find(key)->logicalSize(key.size());
+    }
+    if (context.database.usedBytes() != expected) {
+        throw std::runtime_error(std::string("memory accounting drifted after ") +
+                                 step);
+    }
+}
+
+void testMemoryAccounting(CommandContext& context, const CommandTable& table) {
+    context.database.flush();
+    const std::vector<std::vector<std::string>> steps = {
+        {"RPUSH", "list", "a", "b", "c", "dddddddddddddddddddddddddddddddd"},
+        {"LPUSH", "list", "z"},
+        {"LSET", "list", "1", "a much longer replacement value than before"},
+        {"LPOP", "list", "2"},
+        {"RPOP", "list", "10"},
+        {"SADD", "set", "one", "two", "three", "a-longer-member-name-here"},
+        {"SREM", "set", "one"},
+        {"SPOP", "set"},
+        {"SPOP", "set", "10"},
+        {"HSET", "hash", "f1", "v1", "f2", "short"},
+        {"HSET", "hash", "f2", "a value long enough to leave small-string storage"},
+        {"HINCRBY", "hash", "counter", "5"},
+        {"HINCRBY", "fresh-hash", "counter", "1"},
+        {"HDEL", "hash", "f1", "f2", "counter"},
+        {"ZADD", "zset", "1", "a", "2", "b", "3", "c"},
+        {"ZADD", "zset", "5", "a"},
+        {"ZINCRBY", "zset", "2", "member-that-is-quite-long-indeed"},
+        {"ZINCRBY", "fresh-zset", "1", "m"},
+        {"ZREM", "zset", "b"},
+        {"ZREMRANGEBYRANK", "zset", "0", "0"},
+        {"RENAME", "zset", "renamed"},
+        {"SET", "string", "value"},
+        {"APPEND", "string", "-more"},
+        {"DEL", "renamed", "fresh-hash", "fresh-zset", "string"},
+    };
+    for (const auto& step : steps) {
+        RespValue::Array args;
+        for (const std::string& value : step) {
+            args.push_back(bulk(value));
+        }
+        context.output.clear();
+        table.find(step.front())->handler(context, args);
+        expectAccountingExact(context, step.front().c_str());
+    }
+    expect(context.database.size() == 0 && context.database.usedBytes() == 0,
+           "deleting every key should return used bytes to zero");
+}
+
+void testZaddXxDoesNotCreateKey(CommandContext& context,
+                                const CommandTable& table) {
+    expect(execute(context, table, {"ZADD", "missing-zset", "XX", "1", "a"}) ==
+               ":0\r\n",
+           "ZADD XX on a missing key should add nothing");
+    expect(execute(context, table, {"EXISTS", "missing-zset"}) == ":0\r\n",
+           "ZADD XX on a missing key should not create the key");
+}
+
 int main() {
     try {
         redis_clone::Buffer output;
@@ -400,6 +462,8 @@ int main() {
         testSkipListProperties();
         testSortedSetInvariants();
         testWrongType(context, table);
+        testMemoryAccounting(context, table);
+        testZaddXxDoesNotCreateKey(context, table);
     } catch (const std::exception& error) {
         std::cerr << "Container command test failed: " << error.what() << '\n';
         return 1;

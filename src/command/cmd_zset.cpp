@@ -187,56 +187,55 @@ void cmd_zadd(CommandContext& context, const RespValue::Array& arguments) {
         return;
     }
 
-    if (object == nullptr) {
-        object = &context.database.findOrCreate(key);
-        object->type = ObjType::ZSet;
-        object->data = std::make_unique<ZSet>();
-        zset = std::get<std::unique_ptr<ZSet>>(object->data).get();
-    }
-
     std::size_t added = 0;
     std::size_t changed = 0;
-    for (const auto& [newScore, member] : updates) {
-        const std::optional<double> oldScore = zset->score(member);
-        if (oldScore.has_value()) {
-            if (nx || (gt && newScore <= *oldScore) ||
-                (lt && newScore >= *oldScore)) {
-                continue;
-            }
-            if (*oldScore != newScore && zset->updateScore(member, newScore)) {
+    if (object == nullptr) {
+        if (xx) {
+            // XX only updates existing members, so a missing key stays missing.
+            RespWriter::writeInt(context.output, 0);
+            return;
+        }
+        object = &context.database.create(key, Object{ZSet{}});
+    }
+    context.database.modify(key, *object, [&](Object& value) {
+        ZSet& sortedSet = *std::get<std::unique_ptr<ZSet>>(value.data);
+        for (const auto& [newScore, member] : updates) {
+            const std::optional<double> oldScore = sortedSet.score(member);
+            if (oldScore.has_value()) {
+                if (nx || (gt && newScore <= *oldScore) ||
+                    (lt && newScore >= *oldScore)) {
+                    continue;
+                }
+                if (*oldScore != newScore &&
+                    sortedSet.updateScore(member, newScore)) {
+                    ++changed;
+                }
+            } else if (!xx && sortedSet.add(newScore, member)) {
+                ++added;
                 ++changed;
             }
-        } else if (!xx && zset->add(newScore, member)) {
-            ++added;
-            ++changed;
         }
-    }
+    });
     RespWriter::writeInt(context.output,
                          static_cast<std::int64_t>(changedOnly ? changed : added));
 }
 
 void cmd_zrem(CommandContext& context, const RespValue::Array& arguments) {
     const std::string& key = stringArgument(arguments, 1);
-    const Object* object = nullptr;
-    const ZSet* existing = nullptr;
-    if (!requireZSet(context, key, object, existing)) {
+    Object* object = nullptr;
+    ZSet* zset = nullptr;
+    if (!getMutableZSet(context, key, object, zset)) {
         return;
     }
-    if (existing == nullptr) {
-        RespWriter::writeInt(context.output, 0);
-        return;
-    }
-    ZSet zset = *existing;
     std::size_t removed = 0;
-    for (std::size_t i = 2; i < arguments.size(); ++i) {
-        removed += zset.remove(stringArgument(arguments, i)) ? 1 : 0;
-    }
-    if (removed != 0) {
-        if (zset.size() == 0) {
-            context.database.erase(key);
-        } else {
-            context.database.setObject(key, Object{std::move(zset)}, true);
-        }
+    if (object != nullptr) {
+        context.database.modify(key, *object, [&](Object&) {
+            for (std::size_t i = 2; i < arguments.size(); ++i) {
+                if (zset->remove(stringArgument(arguments, i))) {
+                    ++removed;
+                }
+            }
+        });
     }
     RespWriter::writeInt(context.output, static_cast<std::int64_t>(removed));
 }
@@ -417,25 +416,26 @@ void cmd_zincrby(CommandContext& context, const RespValue::Array& arguments) {
         return;
     }
     const std::string& key = stringArgument(arguments, 1);
-    const Object* existing = context.database.find(key);
-    const auto* holder =
-        existing == nullptr
-            ? nullptr
-            : std::get_if<std::unique_ptr<ZSet>>(&existing->data);
-    if (existing != nullptr && holder == nullptr) {
-        writeWrongTypeError(context.output);
+    Object* object = nullptr;
+    ZSet* zset = nullptr;
+    if (!getMutableZSet(context, key, object, zset)) {
         return;
     }
-    ZSet zset = (holder == nullptr || *holder == nullptr) ? ZSet{} : **holder;
     const std::string& member = stringArgument(arguments, 3);
-    const double newScore = zset.score(member).value_or(0.0) + increment;
+    const double oldScore =
+        zset == nullptr ? 0.0 : zset->score(member).value_or(0.0);
+    const double newScore = oldScore + increment;
     if (std::isnan(newScore)) {
         RespWriter::writeError(context.output,
                                "ERR resulting score is not a number (NaN)");
         return;
     }
-    zset.add(newScore, member);
-    context.database.setObject(key, Object{std::move(zset)}, true);
+    if (object == nullptr) {
+        object = &context.database.create(key, Object{ZSet{}});
+    }
+    context.database.modify(key, *object, [&](Object& value) {
+        std::get<std::unique_ptr<ZSet>>(value.data)->add(newScore, member);
+    });
     RespWriter::writeBulk(context.output, scoreString(newScore));
 }
 
@@ -477,28 +477,22 @@ void cmd_zremrangebyrank(CommandContext& context,
         return;
     }
     const std::string& key = stringArgument(arguments, 1);
-    const Object* object = nullptr;
-    const ZSet* existing = nullptr;
-    if (!requireZSet(context, key, object, existing)) {
+    Object* object = nullptr;
+    ZSet* zset = nullptr;
+    if (!getMutableZSet(context, key, object, zset)) {
         return;
     }
-    if (existing == nullptr) {
+    if (zset == nullptr) {
         RespWriter::writeInt(context.output, 0);
         return;
     }
-    ZSet zset = *existing;
-    const std::vector<ZSet::Entry> entries = zset.rangeByRank(start, stop);
-    for (const auto& [score, member] : entries) {
-        (void)score;
-        zset.remove(member);
-    }
-    if (!entries.empty()) {
-        if (zset.size() == 0) {
-            context.database.erase(key);
-        } else {
-            context.database.setObject(key, Object{std::move(zset)}, true);
+    const std::vector<ZSet::Entry> entries = zset->rangeByRank(start, stop);
+    context.database.modify(key, *object, [&](Object&) {
+        for (const auto& [score, member] : entries) {
+            (void)score;
+            zset->remove(member);
         }
-    }
+    });
     RespWriter::writeInt(context.output,
                          static_cast<std::int64_t>(entries.size()));
 }

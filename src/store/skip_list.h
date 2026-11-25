@@ -21,7 +21,7 @@ public:
     explicit SkipList(double promotionProbability = 0.25);
     SkipList(const SkipList& other);
     SkipList& operator=(const SkipList& other);
-    SkipList(SkipList&&) noexcept = default;
+    SkipList(SkipList&& other) noexcept;
     SkipList& operator=(SkipList&& other) noexcept;
     ~SkipList();
 
@@ -59,6 +59,7 @@ private:
         Node* backward = nullptr;
     };
 
+    static std::size_t nodeBytes(const Node& node) noexcept;
     static bool less(double leftScore, const std::string& leftMember,
                      double rightScore, const std::string& rightMember) noexcept;
     Node* findNode(double score, const std::string& member) const noexcept;
@@ -68,6 +69,7 @@ private:
     std::unique_ptr<Node> head_;
     std::size_t currentLevel_ = 1;
     std::size_t size_ = 0;
+    std::size_t nodeBytes_ = 0;  // heap bytes of all non-head nodes
     double promotionProbability_ = 0.25;
 };
 
